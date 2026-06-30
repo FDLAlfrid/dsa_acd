@@ -1,12 +1,10 @@
-# DeepSeek Agent
-
 <div align="right">
-  <a href="#deepseek-agent">🇺🇸 English</a> · <a href="#deepseek-agent-1">🇨🇳 中文</a>
+  <a href="#deepseek-agent-en">🇺🇸 English</a> · <a href="#deepseek-agent-zh">🇨🇳 中文</a>
 </div>
 
 ---
 
-<a id="deepseek-agent"></a>
+<a id="deepseek-agent-en"></a>
 
 # DeepSeek Agent
 
@@ -54,15 +52,11 @@ GPL 3.0
 
 ---
 
-# DeepSeek Agent
+<a id="deepseek-agent-zh"></a>
 
 <div align="right">
-  <a href="#deepseek-agent">🇺🇸 English</a> · <a href="#deepseek-agent-1">🇨🇳 中文</a>
+  <a href="#deepseek-agent-en">🇺🇸 English</a> · <a href="#deepseek-agent-zh">🇨🇳 中文</a>
 </div>
-
----
-
-<a id="deepseek-agent-1"></a>
 
 # DeepSeek Agent
 
