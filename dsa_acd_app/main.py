@@ -214,7 +214,7 @@ def main(page: ft.Page):
             update_ref_chips()
 
         layout = get_layout_size(page)
-        chat_list = ft.ListView(expand=True, spacing=layout["spacing"], padding=ft.padding.all(layout["padding"]))
+        chat_list = ft.ListView(expand=True, spacing=layout["spacing"], padding=layout["padding"])
 
         def resend_message(idx):
             if not state["api_key"]:
@@ -964,4 +964,4 @@ def main(page: ft.Page):
     if sessions: state["current_session"] = sessions[0]; state["messages"] = load_msgs(sessions[0])
     show_chat()
 
-ft.app(target=main)
+ft.run(main)
