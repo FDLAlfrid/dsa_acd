@@ -25,7 +25,48 @@ python main.py
 
 ```bash
 pip install pyinstaller
+pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
+  --exclude-module=PyQt5 --exclude-module=PyQt6 ^
+  --exclude-module=tkinter --exclude-module=matplotlib ^
+  # Add other modules to exclude here, the line above is an example of what to exclude
+  main.py
+```
+
+For minimal size, use a clean virtual environment:
+
+```bash
+python -m venv venv
+venv\Scripts\activate  # Windows
+# source venv/bin/activate  # macOS/Linux
+pip install flet openai requests
+pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
+```
+
+Or with Conda:
+
+```bash
+conda create -n deepseek_agent python=3.10
+conda activate deepseek_agent
+pip install flet openai requests
+pip install pyinstaller
+pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
+```
+
+### About PyInstaller Module Selection
+
+PyInstaller uses **blacklist exclusion** (`--exclude-module`) because Python's dependency resolution is complex — packages often have implicit dependencies that aren't directly imported. A whitelist approach would miss these and cause runtime errors.
+
+For precise control, use a **spec file**:
+
+```bash
+pyinstaller --name "DeepSeekAgent" --icon=icon.ico main.py --specpath .
+```
+
+Edit `DeepSeekAgent.spec` to customize `excludes`, `hiddenimports`, and `datas`, then:
+
+```bash
+pyinstaller DeepSeekAgent.spec
 ```
 
 ## Data Directory
@@ -63,7 +104,47 @@ python main.py
 
 ```bash
 pip install pyinstaller
+pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
+  --exclude-module=PyQt5 --exclude-module=PyQt6 ^
+  #这里可以添加其他需要排除的模块，上一行是举例
+  main.py
+```
+
+如需最小体积，使用干净的虚拟环境：
+
+```bash
+python -m venv venv
+venv\Scripts\activate  # Windows
+# source venv/bin/activate  # macOS/Linux
+pip install flet openai requests
+pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
+```
+
+或者使用 Conda：
+
+```bash
+conda create -n deepseek_agent python=3.10
+conda activate deepseek_agent
+pip install flet openai requests
+pip install pyinstaller
+pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
+```
+
+### 关于 PyInstaller 模块选择
+
+PyInstaller 使用 **黑名单排除** (`--exclude-module`) 是因为 Python 的依赖解析很复杂 — 包通常有隐式依赖，这些依赖不会被直接导入。白名单方式会遗漏这些依赖，导致运行时错误。
+
+如需精确控制，使用 **spec 文件**：
+
+```bash
+pyinstaller --name "DeepSeekAgent" --icon=icon.ico main.py --specpath .
+```
+
+编辑 `DeepSeekAgent.spec` 自定义 `excludes`、`hiddenimports` 和 `datas`，然后：
+
+```bash
+pyinstaller DeepSeekAgent.spec
 ```
 
 ## 数据目录
