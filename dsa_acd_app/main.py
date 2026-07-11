@@ -113,7 +113,7 @@ def confirm_dialog(page, title, content, on_confirm):
     def handler(e):
         if e.control.data == "yes": on_confirm()
         dlg.open = False; page.update()
-    dlg = ft.AlertDialog(title=ft.Text(title), content=ft.Text(content), actions=[ft.TextButton("取消", data="no", on_click=handler), ft.ElevatedButton("确定", data="yes", on_click=handler, bgcolor=ft.Colors.RED)])
+    dlg = ft.AlertDialog(title=ft.Text(title), content=ft.Text(content), actions=[ft.TextButton("取消", data="no", on_click=handler), ft.Button("确定", data="yes", on_click=handler, bgcolor=ft.Colors.RED)])
     show_dialog(page, dlg)
 
 def check_api_key(key):
@@ -177,7 +177,7 @@ def main(page: ft.Page):
             elif view_name == "files": show_files()
             elif view_name == "sessions": show_sessions()
             elif view_name == "settings": show_settings()
-        return ft.Container(padding=6, bgcolor=colors["card"], content=ft.Row([ft.ElevatedButton("聊天", on_click=lambda e: nav_to("chat"), expand=True), ft.ElevatedButton("文件", on_click=lambda e: nav_to("files"), expand=True), ft.ElevatedButton("会话", on_click=lambda e: nav_to("sessions"), expand=True), ft.ElevatedButton("设置", on_click=lambda e: nav_to("settings"), expand=True)], spacing=5))
+        return ft.Container(padding=6, bgcolor=colors["card"], content=ft.Row([ft.Button("聊天", on_click=lambda e: nav_to("chat"), expand=True), ft.Button("文件", on_click=lambda e: nav_to("files"), expand=True), ft.Button("会话", on_click=lambda e: nav_to("sessions"), expand=True), ft.Button("设置", on_click=lambda e: nav_to("settings"), expand=True)], spacing=5))
 
     # ========== 聊天页面 ==========
     def show_chat():
@@ -250,14 +250,16 @@ def main(page: ft.Page):
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
                     resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
+                    if chat_list.controls and chat_list.controls[-1] == t:
+                        chat_list.controls.remove(t)
                     ac = ""
+                    text_control = ft.Text("", size=13, color=colors["text"])
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), text_control], spacing=4))
+                    chat_list.controls.append(msg_container)
                     for c in resp:
                         if c.choices and c.choices[0].delta.content:
                             ac += c.choices[0].delta.content
-                            if chat_list.controls and chat_list.controls[-1] == t:
-                                chat_list.controls.remove(t)
-                            content_controls = format_content(ac, colors)
-                            chat_list.controls.append(ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"])] + content_controls, spacing=4)))
+                            text_control.value = ac
                             chat_list.scroll_to(offset=0, duration=0)
                             page.update()
                     if ac:
@@ -288,7 +290,7 @@ def main(page: ft.Page):
             msg = state["messages"][idx]
             if msg["role"] == "system": return
             content_input = ft.TextField(label="消息内容", value=msg.get("content", ""), multiline=True, min_lines=3, max_lines=10, expand=True, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("编辑消息"), content=ft.Column([content_input], expand=True), actions=[ft.TextButton("取消"), ft.ElevatedButton("保存"), ft.ElevatedButton("保存并重新发送")])
+            dlg = ft.AlertDialog(title=ft.Text("编辑消息"), content=ft.Column([content_input], expand=True), actions=[ft.TextButton("取消"), ft.Button("保存"), ft.Button("保存并重新发送")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: do_edit(idx, False)
             dlg.actions[2].on_click = lambda e: do_edit(idx, True)
@@ -413,14 +415,16 @@ def main(page: ft.Page):
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
                     resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
+                    if chat_list.controls and chat_list.controls[-1] == t:
+                        chat_list.controls.remove(t)
                     ac = ""
+                    text_control = ft.Text("", size=13, color=colors["text"])
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), text_control], spacing=4))
+                    chat_list.controls.append(msg_container)
                     for c in resp:
                         if c.choices and c.choices[0].delta.content:
                             ac += c.choices[0].delta.content
-                            if chat_list.controls and chat_list.controls[-1] == t:
-                                chat_list.controls.remove(t)
-                            content_controls = format_content(ac, colors)
-                            chat_list.controls.append(ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"])] + content_controls, spacing=4)))
+                            text_control.value = ac
                             chat_list.scroll_to(offset=0, duration=0)
                             page.update()
                     if ac:
@@ -460,7 +464,7 @@ def main(page: ft.Page):
             page.update()
 
         chat_input = ft.TextField(hint_text="输入消息...", expand=True, multiline=True, min_lines=1, max_lines=4, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"]))
-        send_btn = ft.ElevatedButton("发送", on_click=send_chat, width=70)
+        send_btn = ft.Button("发送", on_click=send_chat, width=70)
         session_info_bar = ft.Text("", size=11, color=colors["text_hint"])
 
         def update_session_info():
@@ -469,7 +473,7 @@ def main(page: ft.Page):
             session_info_bar.value = f"{state['current_session']} | ~{tokens} tokens | {chars} 字" if state['current_session'] else "请选择会话"
             session_info_bar.update()
         header = ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text("DeepSeek Agent", size=17, weight=ft.FontWeight.BOLD, color=colors["text"]), session_info_bar], spacing=0), ft.Row([ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="清空", on_click=clear_chat), ft.IconButton(ft.Icons.DELETE_FOREVER, icon_size=16, tooltip="删除会话", on_click=del_current_session), ft.IconButton(ft.Icons.DARK_MODE, icon_size=16, tooltip="切换主题", on_click=toggle_theme)], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
-        context_panel = ft.Container(width=layout["chat_width"], padding=8, bgcolor=colors["card"], content=ft.Column([ft.Text("文件引用", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), ft.ElevatedButton("选择文件", on_click=lambda e: pick_file_dialog(), width=120, height=30)], spacing=5))
+        context_panel = ft.Container(width=layout["chat_width"], padding=8, bgcolor=colors["card"], content=ft.Column([ft.Text("文件引用", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), ft.Button("选择文件", on_click=lambda e: pick_file_dialog(), width=120, height=30)], spacing=5))
 
         def pick_file_dialog():
             def on_result(e):
@@ -583,7 +587,7 @@ def main(page: ft.Page):
             if result is True: show_toast(page, "已保存")
             else: show_toast(page, f"保存失败: {result}")
 
-        save_copy_btn = ft.ElevatedButton("保存", on_click=save_current_file)
+        save_copy_btn = ft.Button("保存", on_click=save_current_file)
         file_content_wrapper.controls = [ft.Row([save_copy_btn, ft.Text("", expand=True), ft.IconButton(ft.Icons.COPY, icon_size=16, tooltip="复制内容", on_click=lambda e: (page.set_clipboard(file_content.value) or show_toast(page, "已复制")) if file_content.value else None)], spacing=8), file_content]
         main_column.controls.extend([ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Icon(ft.Icons.FOLDER, color=colors["primary"]), file_path_input], spacing=8)), ft.Row([ft.Container(content=ft.Column([ft.Text("文件列表", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), file_list], spacing=5), width=layout["file_width"], padding=8), ft.Container(content=ft.Column([file_preview, file_content_wrapper], spacing=5), expand=True, padding=8)], expand=True, spacing=0), nav_bar(colors)])
         page.update()
@@ -614,7 +618,7 @@ def main(page: ft.Page):
 
         def show_new_session_dialog(e):
             new_name_input = ft.TextField(label="会话名称", hint_text="输入名称", autofocus=True, border=ft.InputBorder.OUTLINE, width=300)
-            dlg = ft.AlertDialog(title=ft.Text("新建会话"), content=ft.Column([new_name_input], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("创建")])
+            dlg = ft.AlertDialog(title=ft.Text("新建会话"), content=ft.Column([new_name_input], spacing=10), actions=[ft.TextButton("取消"), ft.Button("创建")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: do_create()
             def do_create():
@@ -628,7 +632,7 @@ def main(page: ft.Page):
 
         def make_delete_btn(session_name):
             def handler(e):
-                dlg = ft.AlertDialog(title=ft.Text("确认删除"), content=ft.Text(f"确定要删除会话「{session_name}」吗？"), actions=[ft.TextButton("取消"), ft.ElevatedButton("删除", bgcolor=ft.Colors.RED)])
+                dlg = ft.AlertDialog(title=ft.Text("确认删除"), content=ft.Text(f"确定要删除会话「{session_name}」吗？"), actions=[ft.TextButton("取消"), ft.Button("删除", bgcolor=ft.Colors.RED)])
                 dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
                 dlg.actions[1].on_click = lambda e, n=session_name: do_delete(n)
                 def do_delete(n):
@@ -653,7 +657,7 @@ def main(page: ft.Page):
         def make_rename_btn(session_name):
             def handler(e):
                 rename_input = ft.TextField(label="新名称", value=session_name, autofocus=True, border=ft.InputBorder.OUTLINE, width=300)
-                dlg = ft.AlertDialog(title=ft.Text("重命名会话"), content=ft.Column([rename_input], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("确定")])
+                dlg = ft.AlertDialog(title=ft.Text("重命名会话"), content=ft.Column([rename_input], spacing=10), actions=[ft.TextButton("取消"), ft.Button("确定")])
                 dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
                 dlg.actions[1].on_click = lambda e: do_rename()
                 def do_rename():
@@ -687,7 +691,7 @@ def main(page: ft.Page):
             page.update()
 
         def delete_all_sessions(e):
-            dlg = ft.AlertDialog(title=ft.Text("确认删除全部"), content=ft.Text("确定要删除所有会话吗？此操作不可恢复。"), actions=[ft.TextButton("取消"), ft.ElevatedButton("全部删除", bgcolor=ft.Colors.RED)])
+            dlg = ft.AlertDialog(title=ft.Text("确认删除全部"), content=ft.Text("确定要删除所有会话吗？此操作不可恢复。"), actions=[ft.TextButton("取消"), ft.Button("全部删除", bgcolor=ft.Colors.RED)])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: do_delete_all()
             def do_delete_all():
@@ -697,7 +701,7 @@ def main(page: ft.Page):
                 show_toast(page, "已删除全部会话"); load_sessions(); show_chat()
             show_dialog(page, dlg)
 
-        main_column.controls.extend([ft.Container(padding=12, content=ft.Column([ft.Text("会话管理", size=17, weight=ft.FontWeight.BOLD, color=colors["text"]), ft.Row([ft.ElevatedButton("新建会话", on_click=show_new_session_dialog, icon=ft.Icons.ADD, width=120), ft.ElevatedButton("全部删除", on_click=delete_all_sessions, icon=ft.Icons.DELETE_SWEEP, width=120, bgcolor=ft.Colors.RED_200)], spacing=8), search_input], spacing=10)), ft.Container(content=session_list, padding=8, expand=True), nav_bar(colors)])
+        main_column.controls.extend([ft.Container(padding=12, content=ft.Column([ft.Text("会话管理", size=17, weight=ft.FontWeight.BOLD, color=colors["text"]), ft.Row([ft.Button("新建会话", on_click=show_new_session_dialog, icon=ft.Icons.ADD, width=120), ft.Button("全部删除", on_click=delete_all_sessions, icon=ft.Icons.DELETE_SWEEP, width=120, bgcolor=ft.Colors.RED_200)], spacing=8), search_input], spacing=10)), ft.Container(content=session_list, padding=8, expand=True), nav_bar(colors)])
         page.update()
         load_sessions()
 
@@ -736,7 +740,7 @@ def main(page: ft.Page):
             rprompt = roles[rname]
             ni = ft.TextField(label="名称", value=rname, border=ft.InputBorder.OUTLINE)
             pi = ft.TextField(label="提示词", value=rprompt, multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("编辑角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("保存")])
+            dlg = ft.AlertDialog(title=ft.Text("编辑角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.Button("保存")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (
                 setattr(dlg, 'open', False) or
@@ -760,7 +764,7 @@ def main(page: ft.Page):
         def add_role(e):
             ni = ft.TextField(label="名称", hint_text="例如: 辩论手", border=ft.InputBorder.OUTLINE)
             pi = ft.TextField(label="提示词", hint_text="你是一位...", multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("新增角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("添加")])
+            dlg = ft.AlertDialog(title=ft.Text("新增角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.Button("添加")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (
                 setattr(dlg, 'open', False) or
@@ -817,7 +821,7 @@ def main(page: ft.Page):
             label, template = state["quick_prompts"][idx]
             li = ft.TextField(label="名称", value=label, border=ft.InputBorder.OUTLINE)
             ti = ft.TextField(label="内容", value=template, multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("编辑快捷提示词"), content=ft.Column([li, ti], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("保存")])
+            dlg = ft.AlertDialog(title=ft.Text("编辑快捷提示词"), content=ft.Column([li, ti], spacing=10), actions=[ft.TextButton("取消"), ft.Button("保存")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (setattr(dlg, 'open', False) or state["quick_prompts"].__setitem__(idx, (li.value.strip(), ti.value.strip())) or load_quick_prompts_ui() or page.update())
             show_dialog(page, dlg)
@@ -828,15 +832,15 @@ def main(page: ft.Page):
         def add_quick_prompt(e):
             li = ft.TextField(label="名称", hint_text="例如: 总结", border=ft.InputBorder.OUTLINE)
             ti = ft.TextField(label="内容", hint_text="例如: 请总结一下", multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("添加快捷提示词"), content=ft.Column([li, ti], spacing=10), actions=[ft.TextButton("取消"), ft.ElevatedButton("添加")])
+            dlg = ft.AlertDialog(title=ft.Text("添加快捷提示词"), content=ft.Column([li, ti], spacing=10), actions=[ft.TextButton("取消"), ft.Button("添加")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (setattr(dlg, 'open', False) or (li.value.strip() and ti.value.strip() and state["quick_prompts"].append((li.value.strip(), ti.value.strip())) or True) or load_quick_prompts_ui() or page.update())
             show_dialog(page, dlg)
 
         balance_text = ft.Text("", size=13, color=colors["text"])
-        balance_btn = ft.ElevatedButton("查询余额")
+        balance_btn = ft.Button("查询余额")
         conn_status_text = ft.Text("", size=12, color=colors["text"])
-        conn_test_btn = ft.ElevatedButton("测试连接")
+        conn_test_btn = ft.Button("测试连接")
 
         def check_balance(e):
             if not state["api_key"]: show_toast(page, "请先设置 API Key"); return
@@ -879,7 +883,7 @@ def main(page: ft.Page):
 
         def clear_cache(e):
             """清理所有缓存会话数据"""
-            dlg = ft.AlertDialog(title=ft.Text("确认清理缓存"), content=ft.Text(f"将删除 {len(list_sessions())} 个会话文件，保留设置。确定继续吗？"), actions=[ft.TextButton("取消"), ft.ElevatedButton("清理会话", bgcolor=ft.Colors.RED)])
+            dlg = ft.AlertDialog(title=ft.Text("确认清理缓存"), content=ft.Text(f"将删除 {len(list_sessions())} 个会话文件，保留设置。确定继续吗？"), actions=[ft.TextButton("取消"), ft.Button("清理会话", bgcolor=ft.Colors.RED)])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: do_clear_cache()
             def do_clear_cache():
@@ -891,7 +895,7 @@ def main(page: ft.Page):
 
         def clear_all_data(e):
             """删除所有本地数据（会话+设置+密钥）"""
-            dlg = ft.AlertDialog(title=ft.Text("确认清除所有数据"), content=ft.Text("将删除全部会话文件、设置文件、API Key 等所有本地数据。此操作不可恢复。"), actions=[ft.TextButton("取消"), ft.ElevatedButton("全部清除", bgcolor=ft.Colors.RED)])
+            dlg = ft.AlertDialog(title=ft.Text("确认清除所有数据"), content=ft.Text("将删除全部会话文件、设置文件、API Key 等所有本地数据。此操作不可恢复。"), actions=[ft.TextButton("取消"), ft.Button("全部清除", bgcolor=ft.Colors.RED)])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: do_clear_all()
             def do_clear_all():
@@ -949,8 +953,8 @@ def main(page: ft.Page):
             ft.Divider(),
             ft.Row([ft.Text("快捷提示词", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), ft.IconButton(ft.Icons.ADD, icon_size=18, tooltip="添加", on_click=add_quick_prompt)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             quick_prompts_list,
-            ft.Row([ft.ElevatedButton("保存设置", on_click=save_settings, width=140), ft.ElevatedButton("清理会话", on_click=clear_cache, width=140, bgcolor=ft.Colors.RED_200)], spacing=8),
-            ft.Row([ft.ElevatedButton("清除所有数据", on_click=clear_all_data, width=200, bgcolor=ft.Colors.RED), ft.IconButton(ft.Icons.FOLDER_OPEN, icon_size=18, tooltip="打开数据文件夹", on_click=lambda e: os.startfile(APP_DIR))], spacing=8),
+            ft.Row([ft.Button("保存设置", on_click=save_settings, width=140), ft.Button("清理会话", on_click=clear_cache, width=140, bgcolor=ft.Colors.RED_200)], spacing=8),
+            ft.Row([ft.Button("清除所有数据", on_click=clear_all_data, width=200, bgcolor=ft.Colors.RED), ft.IconButton(ft.Icons.FOLDER_OPEN, icon_size=18, tooltip="打开数据文件夹", on_click=lambda e: os.startfile(APP_DIR))], spacing=8),
             ft.Text(f"数据目录: {APP_DIR}", size=10, color=colors["text_hint"]),
             ft.Divider(), ft.Text("DeepSeek Agent", size=12, color=colors["text_hint"]),
             ft.TextButton("GitHub: https://github.com/FDLAlfrid/dsa_acd", icon=ft.Icons.OPEN_IN_NEW, on_click=lambda e: page.launch_url("https://github.com/FDLAlfrid/dsa_acd"), style=ft.ButtonStyle(padding=0, color=colors["primary"]))
