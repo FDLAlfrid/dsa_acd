@@ -318,10 +318,10 @@ def main(page: ft.Page):
         def make_message_popup(idx, is_user):
             items = []
             if is_user:
-                items.append(ft.PopupMenuItem(text="编辑", on_click=lambda e: edit_message(idx)))
-                items.append(ft.PopupMenuItem(text="重新发送", on_click=lambda e: resend_message(idx)))
-            items.append(ft.PopupMenuItem(text="删除", on_click=lambda e: delete_message(idx)))
-            items.append(ft.PopupMenuItem(text="复制内容", on_click=lambda e: (page.set_clipboard(state["messages"][idx].get("content", "")) or show_toast(page, "已复制"))))
+                items.append(ft.PopupMenuItem(content="编辑", on_click=lambda e: edit_message(idx)))
+                items.append(ft.PopupMenuItem(content="重新发送", on_click=lambda e: resend_message(idx)))
+            items.append(ft.PopupMenuItem(content="删除", on_click=lambda e: delete_message(idx)))
+            items.append(ft.PopupMenuItem(content="复制内容", on_click=lambda e: (page.set_clipboard(state["messages"][idx].get("content", "")) or show_toast(page, "已复制"))))
             return ft.PopupMenuButton(items=items, icon=ft.Icons.MORE_VERT, icon_size=14, tooltip="操作")
 
         def load_chat():
@@ -517,13 +517,13 @@ def main(page: ft.Page):
 
         def make_file_popup(filename, fp):
             items = []
-            if is_image(fp): items.append(ft.PopupMenuItem(text="打开图片", on_click=lambda e: open_file(fp)))
+            if is_image(fp): items.append(ft.PopupMenuItem(content="打开图片", on_click=lambda e: open_file(fp)))
             elif is_binary(fp):
-                items.append(ft.PopupMenuItem(text="二进制文件", disabled=True))
-                items.append(ft.PopupMenuItem(text="打开所在文件夹", on_click=lambda e: os.startfile(os.path.dirname(fp))))
-            else: items.append(ft.PopupMenuItem(text="打开", on_click=lambda e: open_file(fp)))
-            items.append(ft.PopupMenuItem(text="复制路径", on_click=lambda e: page.set_clipboard(fp) or show_toast(page, "已复制路径")))
-            items.append(ft.PopupMenuItem(text="引用到聊天", on_click=lambda e: add_ref_file(fp)))
+                items.append(ft.PopupMenuItem(content="二进制文件", disabled=True))
+                items.append(ft.PopupMenuItem(content="打开所在文件夹", on_click=lambda e: os.startfile(os.path.dirname(fp))))
+            else: items.append(ft.PopupMenuItem(content="打开", on_click=lambda e: open_file(fp)))
+            items.append(ft.PopupMenuItem(content="复制路径", on_click=lambda e: page.set_clipboard(fp) or show_toast(page, "已复制路径")))
+            items.append(ft.PopupMenuItem(content="引用到聊天", on_click=lambda e: add_ref_file(fp)))
             return ft.PopupMenuButton(items=items, icon=ft.Icons.MORE_VERT, icon_size=16)
 
         def make_file_row(filename, fp, icon, icon_color):
