@@ -1,24 +1,281 @@
 import flet as ft
-import os, json, time, gc, base64, re
+import os, json, time, gc, base64, re, subprocess, sys, platform, shutil, threading, asyncio
 try: from openai import OpenAI
 except: OpenAI = None
+
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("com.deepseek.agent")
+    except:
+        pass
+
+# ============================================================
+# MCP (Model Context Protocol) 客户端 - 与 Trae 共用 MCP 配置
+# ============================================================
+MCP_CONFIG_PATH = os.path.join(os.path.expandvars("%APPDATA%"), "Trae CN", "User", "mcp.json")
+_mcp_servers = {}
+_mcp_tools = {}
+_mcp_lock = threading.Lock()
+
+def _mcp_which(cmd):
+    if os.path.isabs(cmd) and os.path.exists(cmd):
+        return cmd
+    for ext in [".cmd", ".bat", ".exe", ""]:
+        p = shutil.which(cmd + ext)
+        if p: return p
+    return cmd
+
+def _read_mcp_config():
+    if not os.path.exists(MCP_CONFIG_PATH):
+        return {}
+    try:
+        with open(MCP_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception as ex:
+        print(f"[MCP] 读取配置失败: {ex}")
+        return {}
+
+def _get_enabled_mcp_servers():
+    config = _read_mcp_config()
+    servers = config.get("mcpServers", {})
+    enabled = {}
+    for name, cfg in servers.items():
+        if cfg.get("disabled", False): continue
+        if cfg.get("enabled", True) is False: continue
+        enabled[name] = cfg
+    return enabled
+
+class _MCPStdioClient:
+    def __init__(self, name, command, args):
+        self.name = name
+        self.command = command
+        self.args = args
+        self.process = None
+        self._request_id = 0
+        self._lock = threading.Lock()
+        self._initialized = False
+        self._tools = []
+
+    def start(self):
+        try:
+            cmd_path = _mcp_which(self.command)
+            cmd_args = [cmd_path] + self.args
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            self.process = subprocess.Popen(
+                cmd_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                text=True, encoding="utf-8", bufsize=1,
+            )
+            return True
+        except Exception as e:
+            print(f"[MCP] 启动 {self.name} 失败: {e}")
+            self.process = None
+            return False
+
+    def stop(self):
+        if self.process:
+            try: self.process.stdin.close(); self.process.wait(timeout=3)
+            except:
+                try: self.process.kill()
+                except: pass
+            self.process = None
+        self._initialized = False
+        self._tools = []
+
+    def _send(self, method, params=None):
+        if not self.process or self.process.poll() is not None:
+            return None
+        with self._lock:
+            self._request_id += 1
+            req = {"jsonrpc": "2.0", "id": self._request_id, "method": method, "params": params or {}}
+            try:
+                self.process.stdin.write(json.dumps(req) + "\n")
+                self.process.stdin.flush()
+                resp_line = self.process.stdout.readline()
+                if resp_line: return json.loads(resp_line)
+            except Exception as e:
+                print(f"[MCP] {self.name} 请求失败: {e}")
+            return None
+
+    def initialize(self):
+        if not self.start(): return False
+        resp = self._send("initialize", {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "deepseek-agent", "version": "1.0.0"},
+        })
+        if resp and "result" in resp:
+            try:
+                self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+                self.process.stdin.flush()
+            except: pass
+            self._initialized = True
+            return True
+        return False
+
+    def list_tools(self):
+        if not self._initialized: return []
+        resp = self._send("tools/list")
+        if resp and "result" in resp:
+            self._tools = resp["result"].get("tools", [])
+            return self._tools
+        return []
+
+    def call_tool(self, tool_name, arguments):
+        if not self._initialized: return None
+        resp = self._send("tools/call", {"name": tool_name, "arguments": arguments})
+        if resp and "result" in resp: return resp["result"]
+        elif resp and "error" in resp: return {"error": resp["error"]}
+        return None
+
+def _discover_mcp_tools():
+    global _mcp_servers, _mcp_tools
+    with _mcp_lock:
+        _mcp_tools = {}
+        servers = _get_enabled_mcp_servers()
+        if not servers: return []
+        has_npx = _mcp_which("npx") or _mcp_which("npx.cmd")
+        if not has_npx:
+            print("[MCP] 未检测到 npx，跳过 MCP 工具加载")
+            return []
+        result = []
+        for srv_name, srv_cfg in servers.items():
+            if "url" in srv_cfg and "command" not in srv_cfg: continue
+            command = srv_cfg.get("command", "")
+            args = srv_cfg.get("args", [])
+            if not command: continue
+            if srv_name in _mcp_servers:
+                _mcp_servers[srv_name].stop()
+            client = _MCPStdioClient(srv_name, command, args)
+            if not client.initialize():
+                print(f"[MCP] {srv_name} 初始化失败，跳过")
+                continue
+            tools = client.list_tools()
+            if not tools:
+                print(f"[MCP] {srv_name} 没有工具，跳过")
+                client.stop()
+                continue
+            _mcp_servers[srv_name] = client
+            for tool in tools:
+                full_name = f"mcp_{srv_name}_{tool['name']}"
+                _mcp_tools[full_name] = (srv_name, tool["name"])
+                result.append((full_name, tool))
+        return result
+
+def _call_mcp_tool(full_name, arguments):
+    with _mcp_lock:
+        if full_name not in _mcp_tools:
+            return {"error": f"未知 MCP 工具: {full_name}"}
+        srv_name, tool_name = _mcp_tools[full_name]
+        if srv_name not in _mcp_servers:
+            return {"error": f"MCP 服务器 {srv_name} 未连接"}
+        result = _mcp_servers[srv_name].call_tool(tool_name, arguments)
+        return result or {"error": "调用失败"}
+
+def _shutdown_mcp():
+    with _mcp_lock:
+        for name, client in list(_mcp_servers.items()):
+            client.stop()
+        _mcp_servers.clear()
+        _mcp_tools.clear()
+# ============================================================
 
 APP_DIR = os.path.expanduser("~/.deepseek_sessions")
 SESSION_DIR = os.path.join(APP_DIR, "sessions")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+SECURE_KEY_PATH = os.path.join(APP_DIR, "secure_key.dat")
 for d in [APP_DIR, SESSION_DIR]: os.makedirs(d, exist_ok=True)
+
+# ============================================================
+# API Key 安全存储（机器绑定加密）
+# ============================================================
+import hashlib, socket, getpass
+
+def _derive_machine_key():
+    """基于机器信息派生加密密钥（同机器可解密，不同机器无法解密）"""
+    machine_id = f"{socket.gethostname()}:{getpass.getuser()}:dsa_acd_salt_v1"
+    return hashlib.pbkdf2_hmac('sha256', machine_id.encode(), b'deepseek_agent_fixed_salt', 100000, dklen=32)
+
+def _encrypt_api_key(plaintext):
+    """加密 API Key"""
+    if not plaintext: return None
+    key = _derive_machine_key()
+    # XOR 加密
+    plain_bytes = plaintext.encode('utf-8')
+    encrypted = bytes([plain_bytes[i] ^ key[i % len(key)] for i in range(len(plain_bytes))])
+    return base64.b64encode(encrypted).decode('ascii')
+
+def _decrypt_api_key(cipher_b64):
+    """解密 API Key"""
+    if not cipher_b64: return None
+    try:
+        key = _derive_machine_key()
+        encrypted = base64.b64decode(cipher_b64)
+        decrypted = bytes([encrypted[i] ^ key[i % len(key)] for i in range(len(encrypted))])
+        return decrypted.decode('utf-8')
+    except Exception:
+        return None
+
+def _save_secure_api_key(api_key):
+    """将加密后的 API Key 保存到磁盘"""
+    if not api_key:
+        if os.path.exists(SECURE_KEY_PATH):
+            try: os.remove(SECURE_KEY_PATH)
+            except: pass
+        return
+    encrypted = _encrypt_api_key(api_key)
+    if encrypted:
+        try:
+            with open(SECURE_KEY_PATH, "w", encoding="utf-8") as f:
+                json.dump({"key": encrypted}, f)
+        except: pass
+
+def _load_secure_api_key():
+    """从磁盘加载并解密 API Key"""
+    if not os.path.exists(SECURE_KEY_PATH):
+        return ""
+    try:
+        with open(SECURE_KEY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _decrypt_api_key(data.get("key", "")) or ""
+    except Exception:
+        return ""
 
 BINARY_EXTS = {".exe", ".dll", ".bin", ".dat", ".pyc", ".pyd", ".so", ".dylib", ".zip", ".rar", ".7z", ".tar", ".gz", ".iso", ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg"}
 
 DEFAULT_AGENT_ROLES = {
-    "通用助手": "你是一个AI助手，可以读写本地文件、运行命令，请按用户指令操作。",
-    "编程专家": "你是一位资深程序员，擅长代码编写、调试、重构和技术方案设计。回复要专业、准确，提供可运行的代码示例。",
-    "翻译官": "你是一位专业翻译，精通中英文互译。请保持原文风格和语气，专业术语要准确。只返回译文，不需要解释。",
-    "写作助手": "你是一位写作专家，擅长各类文书创作。包括文章、报告、邮件等。注意语言的流畅性和逻辑性。",
-    "代码审查员": "你是一位严格的代码审查专家，每次审查要指出：1)潜在bug 2)性能问题 3)安全风险 4)可改进之处。",
-    "数据分析师": "你是一位数据分析专家，擅长数据解读、趋势分析和可视化建议。请用数据说话，给出 actionable 的洞察。",
-    "教师": "你是一位耐心且知识渊博的老师。善于用简单的方式解释复杂概念，会通过提问引导用户思考。",
+    "通用助手": {
+        "prompt": "你是一个AI助手，可以读写本地文件、运行命令，请按用户指令操作。",
+        "skills": ["总结内容", "翻译成中文", "解释概念"],
+    },
+    "编程专家": {
+        "prompt": "你是一位资深程序员，擅长代码编写、调试、重构和技术方案设计。回复要专业、准确，提供可运行的代码示例。",
+        "skills": ["代码审查", "找Bug", "性能优化", "重构代码", "写注释", "写测试"],
+    },
+    "翻译官": {
+        "prompt": "你是一位专业翻译，精通中英文互译。请保持原文风格和语气，专业术语要准确。只返回译文，不需要解释。",
+        "skills": ["中译英", "英译中", "润色中文"],
+    },
+    "写作助手": {
+        "prompt": "你是一位写作专家，擅长各类文书创作。包括文章、报告、邮件等。注意语言的流畅性和逻辑性。",
+        "skills": ["写文章", "写报告", "写邮件", "润色改写"],
+    },
+    "代码审查员": {
+        "prompt": "你是一位严格的代码审查专家，每次审查要指出：1)潜在bug 2)性能问题 3)安全风险 4)可改进之处。",
+        "skills": ["代码审查", "安全审查", "性能分析"],
+    },
+    "数据分析师": {
+        "prompt": "你是一位数据分析专家，擅长数据解读、趋势分析和可视化建议。请用数据说话，给出 actionable 的洞察。",
+        "skills": ["数据分析", "趋势解读", "可视化建议"],
+    },
+    "教师": {
+        "prompt": "你是一位耐心且知识渊博的老师。善于用简单的方式解释复杂概念，会通过提问引导用户思考。",
+        "skills": ["解释概念", "举例说明", "引导思考"],
+    },
 }
 
 def session_path(name): return os.path.join(SESSION_DIR, f"{name}.json")
@@ -36,6 +293,16 @@ def delete_session(name):
             try: os.remove(path); return
             except PermissionError: gc.collect(); time.sleep(0.1)
             except: return
+
+def create_session(name, system_prompt=None):
+    path = session_path(name)
+    if os.path.exists(path): return False
+    if system_prompt is None:
+        system_prompt = get_default_system_prompt()
+    msgs = [{"role": "system", "content": system_prompt}]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(msgs, f, ensure_ascii=False, indent=2)
+    return True
 
 def save_msgs(name, msgs):
     with open(session_path(name), "w", encoding="utf-8") as f:
@@ -82,6 +349,15 @@ def calc_tokens_count(msgs):
                     total += len(part.get("text", "")) * 1.5
     return int(total)
 
+def _is_cmd_available(cmd):
+    """检测命令是否可用（跨平台）"""
+    try:
+        import shutil
+        found = shutil.which(cmd) or shutil.which(cmd + ".cmd") or shutil.which(cmd + ".exe")
+        return found is not None
+    except Exception:
+        return False
+
 TOOLS = [
     {"type": "function", "function": {"name": "read_file_content", "description": "读取本地文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "write_file_content", "description": "写入文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
@@ -90,7 +366,212 @@ TOOLS = [
     {"type": "function", "function": {"name": "get_balance", "description": "查询 DeepSeek API 余额", "parameters": {"type": "object", "properties": {}}}},
 ]
 
+# 环境检测：按需注册系统工具
+_AVAILABLE_TOOLS = {"npm": False, "git": False, "mcp": False}
+
+if _is_cmd_available("npm"):
+    TOOLS.append({"type": "function", "function": {"name": "npm_run", "description": "运行 npm 命令（install/build/test等）", "parameters": {"type": "object", "properties": {"args": {"type": "string", "description": "npm 参数，如 'install express' 或 'run build' "}}, "required": ["args"]}}})
+    _AVAILABLE_TOOLS["npm"] = True
+
+if _is_cmd_available("git"):
+    TOOLS.append({"type": "function", "function": {"name": "git_run", "description": "运行 Git 命令（status/log/diff等）", "parameters": {"type": "object", "properties": {"args": {"type": "string", "description": "git 参数，如 'status' 或 'log --oneline -5' "}}, "required": ["args"]}}})
+    _AVAILABLE_TOOLS["git"] = True
+
+# 动态加载 MCP 工具（需要 npx 可用）
+def _load_mcp_tools():
+    """加载 Trae 共用的 MCP 工具定义"""
+    try:
+        mcp_tools = _discover_mcp_tools()
+        if not mcp_tools:
+            print("[MCP] 未发现可用的 MCP 工具")
+            return
+        for full_name, tool_def in mcp_tools:
+            TOOLS.append({
+                "type": "function",
+                "function": {
+                    "name": full_name,
+                    "description": f"[MCP:{tool_def.get('description', full_name)}]",
+                    "parameters": tool_def.get("inputSchema", {"type": "object", "properties": {}}),
+                }
+            })
+        _AVAILABLE_TOOLS["mcp"] = True
+        print(f"[MCP] 已加载 {len(mcp_tools)} 个 MCP 工具")
+    except Exception as ex:
+        print(f"[MCP] 加载工具失败: {ex}")
+
+def _enable_mcp():
+    """启用 MCP 工具"""
+    if not state.get("mcp_enabled", False):
+        return
+    # 避免重复加载
+    if _AVAILABLE_TOOLS.get("mcp", False):
+        _shutdown_mcp()
+        TOOLS[:] = [t for t in TOOLS if not t.get("function", {}).get("name", "").startswith("mcp_")]
+        _AVAILABLE_TOOLS["mcp"] = False
+    _load_mcp_tools()
+
+def _disable_mcp():
+    """禁用 MCP 工具"""
+    _shutdown_mcp()
+    TOOLS[:] = [t for t in TOOLS if not t.get("function", {}).get("name", "").startswith("mcp_")]
+    _AVAILABLE_TOOLS["mcp"] = False
+    print("[MCP] 已禁用所有 MCP 工具")
+
 def get_default_system_prompt(): return "你是一个AI助手，可以读写本地文件、运行命令，请按用户指令操作。"
+
+def get_role_prompt(role_name):
+    """获取 Agent 角色的系统提示词"""
+    roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
+    role = roles.get(role_name, DEFAULT_AGENT_ROLES.get("通用助手", {}))
+    if isinstance(role, dict):
+        return role.get("prompt", get_default_system_prompt())
+    return role  # 兼容旧格式
+
+def get_role_skills(role_name):
+    """获取 Agent 角色的技能列表"""
+    roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
+    role = roles.get(role_name, DEFAULT_AGENT_ROLES.get("通用助手", {}))
+    if isinstance(role, dict):
+        return role.get("skills", [])
+    return []
+
+def get_api_params():
+    """根据 thinking_enabled 返回 API 调用参数"""
+    params = {
+        "max_tokens": state.get("max_tokens", 2048),
+    }
+    if state.get("thinking_enabled", False):
+        params["extra_body"] = {"thinking": {"type": "enabled"}}
+        if state.get("reasoning_effort"):
+            params["reasoning_effort"] = state["reasoning_effort"]
+    else:
+        params["extra_body"] = {"thinking": {"type": "disabled"}}
+        params["temperature"] = state.get("temperature", 0.7)
+    return params
+
+def execute_tool_call(fn_name, fn_args):
+    """执行工具调用，返回字符串结果"""
+    try:
+        if fn_name == "read_file_content":
+            return read_file(fn_args.get("path", ""))
+        elif fn_name == "write_file_content":
+            return write_file(fn_args.get("path", ""), fn_args.get("content", ""))
+        elif fn_name == "list_files":
+            return list_dir(fn_args.get("dir", os.getcwd()))
+        elif fn_name == "run_command":
+            return run_cmd(fn_args.get("cmd", ""))
+        elif fn_name == "get_balance":
+            return check_balance()
+        elif fn_name == "npm_run":
+            return run_cmd(f"npm {fn_args.get('args', '')}")
+        elif fn_name == "git_run":
+            return run_cmd(f"git {fn_args.get('args', '')}")
+        elif fn_name.startswith("mcp_"):
+            result = _call_mcp_tool(fn_name, fn_args)
+            if isinstance(result, dict):
+                if "error" in result:
+                    return f"[MCP错误] {json.dumps(result['error'], ensure_ascii=False)}"
+                # 提取 content 数组中的文本
+                content = result.get("content", [])
+                texts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        texts.append(item.get("text", ""))
+                return "\n".join(texts) if texts else json.dumps(result, ensure_ascii=False)
+            return str(result)
+        else:
+            return f"未知工具: {fn_name}"
+    except Exception as ex:
+        return f"工具执行错误: {ex}"
+
+def run_cmd(cmd):
+    """执行命令并返回结果"""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=state.get("current_path", os.getcwd()))
+        out = r.stdout.strip() or r.stderr.strip()
+        # 检测命令不存在的情况
+        if r.returncode != 0:
+            cmd_name = cmd.split()[0] if cmd.split() else cmd
+            if "not recognized" in out or "not found" in out.lower() or "no such file" in out.lower():
+                return f"未找到命令 '{cmd_name}'，请确认已安装并加入 PATH 环境变量"
+        return out[:8000] if len(out) > 8000 else (out or f"命令执行完毕（退出码: {r.returncode}）")
+    except subprocess.TimeoutExpired:
+        return "命令执行超时（30秒）"
+    except FileNotFoundError:
+        cmd_name = cmd.split()[0] if cmd.split() else cmd
+        return f"未找到命令 '{cmd_name}'，请确认已安装并加入 PATH 环境变量"
+    except Exception as ex:
+        return f"命令执行失败: {ex}"
+
+def handle_api_response(msg_list, ac, text_control=None):
+    """
+    处理 API 响应：如果流式有内容直接返回，否则处理 tool_calls 循环
+    返回 (assistant_msgs, tool_call_names)
+    """
+    if ac:
+        return [{"role": "assistant", "content": ac}], []
+
+    assistant_msgs = []
+    tool_calls_used = []
+    current_msgs = list(msg_list)  # 不修改原始 msg_list
+    max_rounds = 5  # 避免无限循环
+    for _ in range(max_rounds):
+        r = state["client"].chat.completions.create(model=state["model"], messages=current_msgs, tools=TOOLS, tool_choice="auto", **get_api_params())
+        msg = r.choices[0].message
+        if msg.content:
+            assistant_msgs.append({"role": "assistant", "content": msg.content})
+            if text_control:
+                tc_text = "[已调用工具: " + ", ".join(tool_calls_used) + "]\n\n" if tool_calls_used else ""
+                text_control.value = tc_text + msg.content
+            return assistant_msgs, tool_calls_used
+        if msg.tool_calls:
+            tc_list = []
+            for tc in msg.tool_calls:
+                tc_list.append({"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}})
+            current_msgs.append({"role": "assistant", "content": None, "tool_calls": tc_list})
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                tool_calls_used.append(fn_name)
+                try:
+                    fn_args = json.loads(tc.function.arguments)
+                except:
+                    fn_args = {}
+                tool_result = execute_tool_call(fn_name, fn_args)
+                if text_control:
+                    text_control.value = f"🔧 调用工具: {fn_name}\n{tool_result[:300]}"
+                    text_control.color = ft.Colors.BLUE_400 if state["theme_mode"] == ft.ThemeMode.DARK else ft.Colors.BLUE_700
+                current_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+            continue
+        break
+    assistant_msgs.append({"role": "assistant", "content": ""})
+    return assistant_msgs, tool_calls_used
+
+def check_balance():
+    """查询 API 余额"""
+    try:
+        if not state.get("client"):
+            return "请先配置 API Key"
+        r = state["client"].balance.retrieve()
+        if r and hasattr(r, 'balance'):
+            return f"余额: {r.balance} {r.currency}"
+        return "无法获取余额信息"
+    except Exception as ex:
+        return f"查询失败: {ex}"
+
+def add_ref_file(path):
+    """全局添加引用文件（聊天页和文件页均可调用）"""
+    try:
+        content = read_file(path)
+        if content.startswith(("文件过大", "文件不存在", "无权限读取", "读取失败")):
+            return False, content
+        if not any(f["path"] == path for f in state["ref_files"]):
+            state["ref_files"].append({"path": path, "content": content})
+            return True, None
+        return False, "已存在"
+    except Exception as ex: return False, f"添加失败: {ex}"
+
+def remove_ref_file(path):
+    state["ref_files"][:] = [f for f in state["ref_files"] if f["path"] != path]
 
 def get_theme_colors():
     is_dark = state["theme_mode"] == ft.ThemeMode.DARK
@@ -98,9 +579,9 @@ def get_theme_colors():
 
 def get_layout_size(p):
     w = p.width if p.width > 0 else 1200
-    if w >= 1200: return {"chat_width": 200, "file_width": 250, "spacing": 12, "padding": 12}
-    elif w >= 1000: return {"chat_width": 180, "file_width": 220, "spacing": 10, "padding": 10}
-    else: return {"chat_width": 150, "file_width": 200, "spacing": 8, "padding": 8}
+    if w >= 1200: return {"sidebar_width": 220, "file_width": 250, "spacing": 12, "padding": 12}
+    elif w >= 1000: return {"sidebar_width": 200, "file_width": 220, "spacing": 10, "padding": 10}
+    else: return {"sidebar_width": 180, "file_width": 200, "spacing": 8, "padding": 8}
 
 def show_toast(page, msg):
     page.snack_bar = ft.SnackBar(ft.Text(msg))
@@ -129,24 +610,57 @@ def main(page: ft.Page):
     page.title = "DeepSeek Agent"
     page.padding = 0; page.spacing = 0
 
-    # 图标（嵌入 base64，确保任务栏和标题栏图标一致）
+    # 窗口关闭时清理 MCP 连接
+    def on_window_close(e):
+        try:
+            _shutdown_mcp()
+            print("[MCP] 已关闭所有连接")
+        except:
+            pass
+    page.on_close = on_window_close
+
+    # 图标（确保任务栏和标题栏图标一致）
     try:
-        page.icon = f"data:image/x-icon;base64,{ICON_B64}"
+        if getattr(sys, 'frozen', False):
+            icon_path = os.path.join(sys._MEIPASS, "icon.ico")
+        else:
+            icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
+        page.window_icon = icon_path
     except: pass
 
-    state = {"api_key": "", "model": "deepseek-v4-flash", "theme_mode": ft.ThemeMode.LIGHT, "current_session": "", "messages": [], "current_path": os.getcwd(), "system_prompt": get_default_system_prompt(), "quick_prompts": [("总结", "请总结一下以上内容"), ("翻译", "请翻译成中文"), ("代码审查", "请审查以下代码")], "client": None, "max_context_tokens": 32000, "max_tokens": 2048, "temperature": 0.7, "agent_role": "通用助手", "agent_roles": dict(DEFAULT_AGENT_ROLES)}
+    state = {"api_key": "", "model": "deepseek-v4-flash", "theme_mode": ft.ThemeMode.LIGHT, "current_session": "", "messages": [], "current_path": os.getcwd(), "system_prompt": get_default_system_prompt(), "quick_prompts": [("总结", "请总结一下以上内容"), ("翻译", "请翻译成中文"), ("代码审查", "请审查以下代码")], "client": None, "max_context_tokens": 32000, "max_tokens": 2048, "temperature": 0.7, "thinking_enabled": False, "reasoning_effort": "high", "agent_role": "通用助手", "agent_roles": dict(DEFAULT_AGENT_ROLES), "ref_files": [], "mcp_enabled": False, "balance_result": "", "conn_result": ""}
+
+    async def _safe_update():
+        """安全更新页面 - 可在任何线程中通过 page.run_task 调用"""
+        page.update()
+
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                # 不从文件读取 API Key（隐私安全，仅内存持有）
-                saved.pop("api_key", None)
+                # 迁移旧版明文 API Key 到加密存储
+                old_plain_key = saved.pop("api_key", "").strip()
+                if old_plain_key and not os.path.exists(SECURE_KEY_PATH):
+                    _save_secure_api_key(old_plain_key)
+                    # 回写 settings.json 去掉 api_key 字段
+                    with open(SETTINGS_PATH, "w", encoding="utf-8") as fw:
+                        json.dump(saved, fw, ensure_ascii=False, indent=2)
                 state.update(saved)
         except: pass
+
+    # 从加密文件加载 API Key
+    secure_key = _load_secure_api_key()
+    if secure_key:
+        state["api_key"] = secure_key
+        print("[安全] 已从加密存储加载 API Key")
 
     try:
         state["client"] = OpenAI(api_key=state["api_key"], base_url="https://api.deepseek.com/v1") if OpenAI else None
     except: pass
+
+    # 启动时根据设置加载 MCP 工具
+    if state.get("mcp_enabled", False):
+        _load_mcp_tools()
 
     page.theme_mode = state["theme_mode"]
     colors = get_theme_colors(); page.bgcolor = colors["bg"]
@@ -185,33 +699,60 @@ def main(page: ft.Page):
         colors = get_theme_colors()
         main_column.controls.clear()
 
-        ref_files = []
         ref_chips = ft.Row(wrap=True, spacing=3)
+
+        def show_ref_detail(f):
+            """点击引用标签：查看/编辑文件内容，支持重新发送"""
+            lines = f["content"].count('\n') + 1
+            chars = len(f["content"])
+            edit_field = ft.TextField(value=f["content"], multiline=True, min_lines=6, max_lines=20, expand=True, border=ft.InputBorder.OUTLINE, color=colors["text"])
+            info_text = ft.Text(f"{os.path.basename(f['path'])} ({lines}行, {chars}字符)", size=12, color=colors["text_hint"])
+            def save_edit():
+                f["content"] = edit_field.value
+                update_ref_chips()
+                dlg.open = False; page.update()
+                show_toast(page, "引用内容已更新，可重新发送")
+            def resend_with_ref():
+                f["content"] = edit_field.value
+                update_ref_chips()
+                dlg.open = False; page.update()
+                if state["messages"]:
+                    last_user = None
+                    for i in range(len(state["messages"])-1, -1, -1):
+                        if state["messages"][i]["role"] == "user":
+                            last_user = i; break
+                    if last_user is not None:
+                        state["messages"] = state["messages"][:last_user+1]
+                        state["messages"][-1]["ref_files"] = [{"path": rf["path"], "content": rf["content"]} for rf in state["ref_files"]]
+                        state["messages"][-1]["content"] = f"[重新发送] {state['messages'][-1]['content']}"
+                        save_msgs(state["current_session"], state["messages"])
+                        update_session_info()
+                        load_chat()
+                        send_chat(None)
+                        return
+                show_toast(page, "请先发送一条消息再重新发送")
+            dlg = ft.AlertDialog(title=ft.Text(f"引用: {os.path.basename(f['path'])}"), content=ft.Column([info_text, edit_field], spacing=10, expand=True), actions=[ft.TextButton("关闭"), ft.Button("保存修改"), ft.Button("重新发送", bgcolor=ft.Colors.BLUE)])
+            dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
+            dlg.actions[1].on_click = lambda e: save_edit()
+            dlg.actions[2].on_click = lambda e: resend_with_ref()
+            show_dialog(page, dlg)
 
         def update_ref_chips():
             ref_chips.controls.clear()
-            for f in ref_files:
+            for f in state["ref_files"]:
                 lines = f["content"].count('\n') + 1
-                ref_chips.controls.append(ft.Container(content=ft.Row([ft.Column([ft.Text(f"{os.path.basename(f['path'])} ({lines}行)", size=11, weight=ft.FontWeight.W_500), ft.Text(f["path"], size=9, color=colors["text_hint"])], spacing=0, expand=True), ft.IconButton(ft.Icons.CLOSE, icon_size=14, on_click=lambda e, p=f["path"]: remove_ref_file(p))], spacing=2), bgcolor=colors["card"], border_radius=8, padding=ft.padding.symmetric(4, 8)))
+                ref_chips.controls.append(ft.Container(
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(f"{os.path.basename(f['path'])} ({lines}行)", size=11, weight=ft.FontWeight.W_500),
+                            ft.Text(f["path"], size=9, color=colors["text_hint"])
+                        ], spacing=0, expand=True),
+                        ft.IconButton(ft.Icons.EDIT, icon_size=14, tooltip="查看/编辑", on_click=lambda e, rf=f: show_ref_detail(rf)),
+                        ft.IconButton(ft.Icons.CLOSE, icon_size=14, on_click=lambda e, p=f["path"]: (remove_ref_file(p), update_ref_chips()))
+                    ], spacing=2),
+                    bgcolor=colors["selected"], border_radius=8, padding=ft.Padding.only(left=8, top=4, right=8, bottom=4)
+                ))
             ref_chips.update()
-
-        def add_ref_file(path):
-            try:
-                content = read_file(path)
-                if content.startswith(("文件过大", "文件不存在", "无权限读取", "读取失败")):
-                    show_toast(page, content)
-                    return
-                if not any(f["path"] == path for f in ref_files):
-                    ref_files.append({"path": path, "content": content})
-                    update_ref_chips()
-                    lines = content.count('\n') + 1
-                    chars = len(content)
-                    show_toast(page, f"已引用: {os.path.basename(path)} ({lines}行, {chars}字符)")
-            except Exception as ex: show_toast(page, f"添加失败: {ex}")
-
-        def remove_ref_file(path):
-            ref_files[:] = [f for f in ref_files if f["path"] != path]
-            update_ref_chips()
 
         layout = get_layout_size(page)
         chat_list = ft.ListView(expand=True, spacing=layout["spacing"], padding=layout["padding"])
@@ -223,7 +764,7 @@ def main(page: ft.Page):
             if not check_api_key(state["api_key"]):
                 show_toast(page, "API Key 格式不正确，请检查")
                 return
-            if not state["client"]: show_toast(page, "请先保存设置以初始化连接"); return
+            if not state["client"]: show_toast(page, "请先设置 API Key"); return
             msg = state["messages"][idx]
             if msg["role"] != "user": return
             state["messages"] = state["messages"][:idx+1]
@@ -249,24 +790,53 @@ def main(page: ft.Page):
                                 ref_content = "\n\n".join(ref_parts) + "\n\n"
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
-                    resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
+                    resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", **get_api_params())
                     if chat_list.controls and chat_list.controls[-1] == t:
                         chat_list.controls.remove(t)
                     ac = ""
-                    text_control = ft.Text("", size=13, color=colors["text"])
-                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), text_control], spacing=4))
+                    rc = ""
+                    text_control = ft.Text("正在思考...", size=13, color=colors["text_hint"])
+                    reasoning_control = ft.Text("", size=12, color=colors["text_hint"], italic=True)
+                    reasoning_container = ft.Container(padding=ft.Padding.only(left=8, top=4, right=8, bottom=4), border_radius=4, bgcolor=colors["card"], content=reasoning_control, visible=False)
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), reasoning_container, text_control], spacing=4))
                     chat_list.controls.append(msg_container)
+                    page.run_task(_safe_update)
                     for c in resp:
-                        if c.choices and c.choices[0].delta.content:
-                            ac += c.choices[0].delta.content
-                            text_control.value = ac
-                            chat_list.scroll_to(offset=0, duration=0)
-                            page.update()
+                        if c.choices:
+                            rc_delta = getattr(c.choices[0].delta, 'reasoning_content', None)
+                            if rc_delta:
+                                rc += rc_delta
+                                reasoning_control.value = f"思考过程:\n{rc}"
+                                reasoning_container.visible = True
+                                page.run_task(_safe_update)
+                            elif c.choices[0].delta.content:
+                                ac += c.choices[0].delta.content
+                                text_control.value = ac
+                                text_control.color = colors["text"]
+                                chat_list.scroll_to(offset=0, duration=0)
+                                page.run_task(_safe_update)
                     if ac:
                         state["messages"].append({"role": "assistant", "content": ac})
                     else:
-                        r = state["client"].chat.completions.create(model=state["model"], messages=msg_list, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
-                        state["messages"].append({"role": "assistant", "content": r.choices[0].message.content or ""})
+                        # 显示工具调用提示
+                        text_control.value = "正在调用工具..."
+                        text_control.color = colors["text_hint"]
+                        page.run_task(_safe_update)
+                        results, tool_calls = handle_api_response(msg_list, ac, text_control)
+                        # 添加工具调用指示器
+                        if tool_calls:
+                            tc_indicator = ft.Container(
+                                padding=ft.Padding.only(left=10, top=6, right=10, bottom=6),
+                                border_radius=6,
+                                bgcolor=colors["selected"],
+                                content=ft.Row([
+                                    ft.Icon(ft.Icons.BUILD, size=14, color=colors["primary"]),
+                                    ft.Text(f"已调用: {', '.join(tool_calls)}", size=12, color=colors["primary"], weight=ft.FontWeight.W_500)
+                                ], spacing=6)
+                            )
+                            chat_list.controls.insert(-1, tc_indicator)
+                        for r in results:
+                            state["messages"].append(r)
                     save_msgs(state["current_session"], state["messages"])
                     load_chat()
                 except Exception as ex:
@@ -282,7 +852,7 @@ def main(page: ft.Page):
                     else:
                         error_text = f"错误: {ex}"
                     chat_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["error_msg"], content=ft.Text(error_text, color=ft.Colors.RED, size=12)))
-                    page.update()
+                    page.run_task(_safe_update)
             import threading
             threading.Thread(target=do_resend, daemon=True).start()
 
@@ -323,7 +893,7 @@ def main(page: ft.Page):
                 items.append(ft.PopupMenuItem(content="编辑", on_click=lambda e: edit_message(idx)))
                 items.append(ft.PopupMenuItem(content="重新发送", on_click=lambda e: resend_message(idx)))
             items.append(ft.PopupMenuItem(content="删除", on_click=lambda e: delete_message(idx)))
-            items.append(ft.PopupMenuItem(content="复制内容", on_click=lambda e: (page.set_clipboard(state["messages"][idx].get("content", "")) or show_toast(page, "已复制"))))
+            items.append(ft.PopupMenuItem(content="复制内容", on_click=lambda e: (page.clipboard.set(state["messages"][idx].get("content", "")) or show_toast(page, "已复制"))))
             return ft.PopupMenuButton(items=items, icon=ft.Icons.MORE_VERT, icon_size=14, tooltip="操作")
 
         def load_chat():
@@ -345,7 +915,7 @@ def main(page: ft.Page):
                 if ref_files:
                     ref_chips_for_display = ft.Row(wrap=True, spacing=3)
                     for rf in ref_files:
-                        ref_chips_for_display.controls.append(ft.Container(content=ft.Row([ft.Icon(ft.Icons.FILE_OPEN), ft.Text(os.path.basename(rf["path"]), size=11)]), bgcolor=colors["primary"], border_radius=4, padding=ft.padding.symmetric(2, 6)))
+                        ref_chips_for_display.controls.append(ft.Container(content=ft.Row([ft.Icon(ft.Icons.FILE_OPEN), ft.Text(os.path.basename(rf["path"]), size=11)]), bgcolor=colors["primary"], border_radius=4, padding=ft.Padding.only(left=6, top=2, right=6, bottom=2)))
                     content_controls.insert(0, ft.Row([ft.Text("引用文件:", size=11, weight=ft.FontWeight.W_500), ref_chips_for_display], spacing=4, wrap=True))
 
                 message_row = ft.Row([ft.Column([ft.Text("你" if is_user else "AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"])] + content_controls, spacing=4, expand=True), make_message_popup(idx, is_user)], spacing=5)
@@ -353,7 +923,7 @@ def main(page: ft.Page):
                     message_row.controls.insert(0, jump_btn)
                 chat_list.controls.append(ft.Container(padding=10, border_radius=8, bgcolor=colors["user_msg"] if is_user else colors["assistant_msg"], content=message_row))
             update_session_info()
-            page.update()
+            page.run_task(_safe_update)
 
         def format_content(content, colors):
             parts = re.split(r'(```[\w]*\n?[\s\S]*?```)', content)
@@ -362,7 +932,7 @@ def main(page: ft.Page):
                 if part.startswith("```"):
                     lang = part.split('\n')[0].replace('`', '').strip()
                     code = '\n'.join(part.split('\n')[1:-1])
-                    controls.append(ft.Container(padding=8, border_radius=5, bgcolor=colors["code_bg"], content=ft.Column([ft.Row([ft.Text(lang or "code", size=10, weight=ft.FontWeight.W_500), ft.IconButton(ft.Icons.COPY, icon_size=14, on_click=lambda e, c=code: page.set_clipboard(c) or show_toast(page, "已复制"))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Text(code, size=12, font_family="Consolas")], spacing=4)))
+                    controls.append(ft.Container(padding=8, border_radius=5, bgcolor=colors["code_bg"], content=ft.Column([ft.Row([ft.Text(lang or "code", size=10, weight=ft.FontWeight.W_500), ft.IconButton(ft.Icons.COPY, icon_size=14, on_click=lambda e, c=code: page.clipboard.set(c) or show_toast(page, "已复制"))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Text(code, size=12, font_family="Consolas")], spacing=4)))
                 elif part.strip(): controls.append(ft.Text(part.strip(), size=13, color=colors["text"]))
             return controls or [ft.Text("", size=13)]
 
@@ -374,7 +944,7 @@ def main(page: ft.Page):
                 show_toast(page, "API Key 格式不正确，请检查")
                 return
             if not state["current_session"]: show_toast(page, "请先选择或新建会话"); return
-            if not state["client"]: show_toast(page, "请先保存设置以初始化连接"); return
+            if not state["client"]: show_toast(page, "请先设置 API Key"); return
             text = chat_input.value.strip()
             if not text: return
             send_btn.disabled = True
@@ -382,8 +952,8 @@ def main(page: ft.Page):
             page.update()
 
             ref_files_data = []
-            if ref_files:
-                ref_files_data = [{"path": f["path"], "content": f["content"]} for f in ref_files]
+            if state["ref_files"]:
+                ref_files_data = [{"path": f["path"], "content": f["content"]} for f in state["ref_files"]]
 
             chat_input.value = ""
             state["messages"].append({"role": "user", "content": text, "ref_files": ref_files_data})
@@ -414,24 +984,53 @@ def main(page: ft.Page):
                                 ref_content = "\n\n".join(ref_parts) + "\n\n"
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
-                    resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
+                    resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", **get_api_params())
                     if chat_list.controls and chat_list.controls[-1] == t:
                         chat_list.controls.remove(t)
                     ac = ""
-                    text_control = ft.Text("", size=13, color=colors["text"])
-                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), text_control], spacing=4))
+                    rc = ""
+                    text_control = ft.Text("正在思考...", size=13, color=colors["text_hint"])
+                    reasoning_control = ft.Text("", size=12, color=colors["text_hint"], italic=True)
+                    reasoning_container = ft.Container(padding=ft.Padding.only(left=8, top=4, right=8, bottom=4), border_radius=4, bgcolor=colors["card"], content=reasoning_control, visible=False)
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), reasoning_container, text_control], spacing=4))
                     chat_list.controls.append(msg_container)
+                    page.run_task(_safe_update)
                     for c in resp:
-                        if c.choices and c.choices[0].delta.content:
-                            ac += c.choices[0].delta.content
-                            text_control.value = ac
-                            chat_list.scroll_to(offset=0, duration=0)
-                            page.update()
+                        if c.choices:
+                            rc_delta = getattr(c.choices[0].delta, 'reasoning_content', None)
+                            if rc_delta:
+                                rc += rc_delta
+                                reasoning_control.value = f"思考过程:\n{rc}"
+                                reasoning_container.visible = True
+                                page.run_task(_safe_update)
+                            elif c.choices[0].delta.content:
+                                ac += c.choices[0].delta.content
+                                text_control.value = ac
+                                text_control.color = colors["text"]
+                                chat_list.scroll_to(offset=0, duration=0)
+                                page.run_task(_safe_update)
                     if ac:
                         state["messages"].append({"role": "assistant", "content": ac})
                     else:
-                        r = state["client"].chat.completions.create(model=state["model"], messages=msg_list, tools=TOOLS, tool_choice="auto", max_tokens=state.get("max_tokens", 2048), temperature=state.get("temperature", 0.7))
-                        state["messages"].append({"role": "assistant", "content": r.choices[0].message.content or ""})
+                        # 显示工具调用提示
+                        text_control.value = "正在调用工具..."
+                        text_control.color = colors["text_hint"]
+                        page.run_task(_safe_update)
+                        results, tool_calls = handle_api_response(msg_list, ac, text_control)
+                        # 添加工具调用指示器
+                        if tool_calls:
+                            tc_indicator = ft.Container(
+                                padding=ft.Padding.only(left=10, top=6, right=10, bottom=6),
+                                border_radius=6,
+                                bgcolor=colors["selected"],
+                                content=ft.Row([
+                                    ft.Icon(ft.Icons.BUILD, size=14, color=colors["primary"]),
+                                    ft.Text(f"已调用: {', '.join(tool_calls)}", size=12, color=colors["primary"], weight=ft.FontWeight.W_500)
+                                ], spacing=6)
+                            )
+                            chat_list.controls.insert(-1, tc_indicator)
+                        for r in results:
+                            state["messages"].append(r)
                     save_msgs(state["current_session"], state["messages"])
                     load_chat()
                 except Exception as ex:
@@ -447,21 +1046,60 @@ def main(page: ft.Page):
                     else:
                         error_text = f"错误: {ex}"
                     chat_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["error_msg"], content=ft.Text(error_text, color=ft.Colors.RED, size=12)))
-                    page.update()
+                    page.run_task(_safe_update)
                 finally:
                     send_btn.disabled = False
                     send_btn.text = "发送"
-                    page.update()
+                    page.run_task(_safe_update)
 
             import threading
             threading.Thread(target=do_send, daemon=True).start()
 
-        quick_prompts_row = ft.Row(wrap=True, spacing=4)
-        def load_quick_prompts():
-            quick_prompts_row.controls.clear()
-            for label, template in state["quick_prompts"]:
-                quick_prompts_row.controls.append(ft.TextButton(label, on_click=lambda e, t=template: setattr(chat_input, 'value', t) or chat_input.update(), style=ft.ButtonStyle(padding=5)))
+        # == Agent 选择器 + 技能按钮 + 深度思考开关 ==
+        agent_names = list(state.get("agent_roles", DEFAULT_AGENT_ROLES).keys())
+        agent_dropdown = ft.Dropdown(value=state.get("agent_role", "通用助手"), options=[ft.dropdown.Option(k) for k in agent_names], width=130, text_size=12, border=ft.InputBorder.OUTLINE, color=colors["text"])
+        def on_agent_change(e):
+            state["agent_role"] = agent_dropdown.value
+            state["system_prompt"] = get_role_prompt(agent_dropdown.value)
+            # 更新当前会话的 system prompt
+            if state["messages"] and state["messages"][0].get("role") == "system":
+                state["messages"][0]["content"] = state["system_prompt"]
+                save_msgs(state["current_session"], state["messages"])
+            refresh_skills_bar()
             page.update()
+        agent_dropdown.on_change = on_agent_change
+
+        skills_bar = ft.Row([], spacing=4, wrap=True)
+
+        def refresh_skills_bar():
+            skills_bar.controls.clear()
+            skills = get_role_skills(state.get("agent_role", "通用助手"))
+            for s in skills:
+                def make_skill_click(sn):
+                    return lambda e: use_skill(sn)
+                skills_bar.controls.append(ft.Container(padding=ft.Padding.only(left=8, right=8, top=2, bottom=2), border_radius=10, bgcolor=colors["primary"], content=ft.Text(s, size=11, color=ft.Colors.WHITE), on_click=make_skill_click(s)))
+            page.update()
+
+        def use_skill(skill_name):
+            chat_input.value = f"[{skill_name}] "
+            chat_input.focus()
+            page.update()
+
+        refresh_skills_bar()
+
+        # 深度思考开关
+        deep_think_switch = ft.Switch(value=state.get("thinking_enabled", False), label="深度思考", label_position=ft.LabelPosition.RIGHT)
+        deep_think_label = ft.Text("", size=11, color=colors["text_hint"])
+        def on_deep_think_change(e):
+            state["thinking_enabled"] = deep_think_switch.value
+            deep_think_label.value = "开启 (reasoning_effort=high)" if state["thinking_enabled"] else "关闭"
+            deep_think_label.color = ft.Colors.GREEN if state["thinking_enabled"] else colors["text_hint"]
+            page.update()
+        deep_think_switch.on_change = on_deep_think_change
+        deep_think_label.value = "开启 (reasoning_effort=high)" if state.get("thinking_enabled", False) else "关闭"
+        deep_think_label.color = ft.Colors.GREEN if state.get("thinking_enabled", False) else colors["text_hint"]
+
+        quick_bar = ft.Row([agent_dropdown, ft.Container(expand=True, content=skills_bar), deep_think_switch, deep_think_label], spacing=8, alignment=ft.MainAxisAlignment.START)
 
         chat_input = ft.TextField(hint_text="输入消息...", expand=True, multiline=True, min_lines=1, max_lines=4, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"]))
         send_btn = ft.Button("发送", on_click=send_chat, width=70)
@@ -473,19 +1111,105 @@ def main(page: ft.Page):
             session_info_bar.value = f"{state['current_session']} | ~{tokens} tokens | {chars} 字" if state['current_session'] else "请选择会话"
             session_info_bar.update()
         header = ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text("DeepSeek Agent", size=17, weight=ft.FontWeight.BOLD, color=colors["text"]), session_info_bar], spacing=0), ft.Row([ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="清空", on_click=clear_chat), ft.IconButton(ft.Icons.DELETE_FOREVER, icon_size=16, tooltip="删除会话", on_click=del_current_session), ft.IconButton(ft.Icons.DARK_MODE, icon_size=16, tooltip="切换主题", on_click=toggle_theme)], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
-        context_panel = ft.Container(width=layout["chat_width"], padding=8, bgcolor=colors["card"], content=ft.Column([ft.Text("文件引用", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), ft.Button("选择文件", on_click=lambda e: pick_file_dialog(), width=120, height=30)], spacing=5))
 
-        def pick_file_dialog():
-            def on_result(e):
-                if e.files: add_ref_file(e.files[0].path)
-            picker = ft.FilePicker(on_result=on_result)
-            page.overlay.append(picker); page.update(); picker.pick_files()
+        # == 左侧会话列表（类 ChatGPT 布局）==
+        sidebar_search = ft.TextField(hint_text="搜索...", border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"]), text_size=11, on_change=lambda e: refresh_sidebar())
+        sidebar_list = ft.ListView(expand=True, spacing=1)
 
-        main_column.controls.extend([header, ft.Row([context_panel, ft.Container(content=chat_list, expand=True)], expand=True, spacing=0), ft.Container(padding=layout["padding"], content=ft.Column([quick_prompts_row, ref_chips, ft.Row([chat_input, send_btn], spacing=layout["spacing"])], spacing=layout["spacing"])), nav_bar(colors)])
+        def refresh_sidebar():
+            sidebar_list.controls.clear()
+            sessions = list_sessions()
+            query = sidebar_search.value.strip().lower() if sidebar_search.value else ""
+            if query: sessions = [s for s in sessions if query in s.lower()]
+            if not sessions:
+                sidebar_list.controls.append(ft.Container(padding=20, content=ft.Text("暂无会话" if not query else "无匹配", size=12, color=colors["text_hint"])))
+            for s in sessions:
+                is_current = s == state["current_session"]
+                sp = session_path(s)
+                info = ""
+                if os.path.exists(sp):
+                    try:
+                        with open(sp, "r", encoding="utf-8") as f: msgs = json.load(f)
+                        cnt = sum(1 for m in msgs if m.get("role") != "system")
+                        tk = calc_tokens_count(msgs)
+                        info = f"{cnt}条 · ~{tk}tk"
+                    except: pass
+                def make_switch(name):
+                    return lambda e: switch_session(name)
+                def make_rename(name):
+                    return lambda e: rename_session_dialog(name)
+                def make_delete(name):
+                    return lambda e: delete_session_dialog(name)
+                sidebar_list.controls.append(ft.Container(
+                    padding=6, border_radius=6,
+                    bgcolor=colors["selected"] if is_current else colors["card"],
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(s, size=12, weight=ft.FontWeight.BOLD if is_current else ft.FontWeight.NORMAL, color=colors["text"]),
+                            ft.Text(info, size=10, color=colors["text_hint"])
+                        ], spacing=0, expand=True),
+                        ft.PopupMenuButton(items=[ft.PopupMenuItem(content="重命名", on_click=make_rename(s)), ft.PopupMenuItem(content="删除", on_click=make_delete(s))], icon=ft.Icons.MORE_VERT, icon_size=14)
+                    ], spacing=2),
+                    on_click=make_switch(s)
+                ))
+            sidebar_list.update()
+
+        def switch_session(name):
+            if name == state["current_session"]: return
+            save_current_state()
+            state["current_session"] = name
+            state["messages"] = load_msgs(name)
+            # 同步系统提示词：如果当前有系统提示词且会话第一个消息是 system，则更新
+            if state["messages"] and state["messages"][0].get("role") == "system":
+                state["messages"][0]["content"] = state["system_prompt"]
+            show_chat()
+
+        def rename_session_dialog(name):
+            ni = ft.TextField(label="新名称", value=name, border=ft.InputBorder.OUTLINE, width=250)
+            dlg = ft.AlertDialog(title=ft.Text("重命名"), content=ft.Column([ni], spacing=10), actions=[ft.TextButton("取消"), ft.Button("确认")])
+            dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
+            dlg.actions[1].on_click = lambda e: (
+                setattr(dlg, 'open', False) or
+                (ni.value.strip() and ni.value.strip() != name and rename_session(name, ni.value.strip()) or True) or
+                show_chat()
+            )
+            show_dialog(page, dlg)
+
+        def delete_session_dialog(name):
+            def do_del():
+                delete_session(name)
+                if state["current_session"] == name:
+                    sessions = list_sessions()
+                    state["current_session"] = sessions[0] if sessions else ""
+                    state["messages"] = load_msgs(sessions[0]) if sessions else []
+                show_chat()
+            confirm_dialog(page, "确认删除", f"确定删除会话「{name}」？", do_del)
+
+        def create_new_session(e):
+            ni = ft.TextField(label="会话名称", hint_text="输入名称", autofocus=True, border=ft.InputBorder.OUTLINE, width=250)
+            dlg = ft.AlertDialog(title=ft.Text("新建会话"), content=ft.Column([ni], spacing=10), actions=[ft.TextButton("取消"), ft.Button("创建")])
+            dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
+            dlg.actions[1].on_click = lambda e: (
+                setattr(dlg, 'open', False) or
+                (ni.value.strip() and create_session(ni.value.strip(), state["system_prompt"]) or True) or
+                show_chat()
+            )
+            show_dialog(page, dlg)
+
+        sidebar = ft.Container(width=layout["sidebar_width"], padding=8, bgcolor=colors["card"], content=ft.Column([
+            ft.Row([ft.Button("+ 新建", on_click=create_new_session, height=32), ft.IconButton(ft.Icons.REFRESH, icon_size=16, tooltip="刷新", on_click=lambda e: refresh_sidebar())], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            sidebar_search, sidebar_list
+        ], spacing=4, expand=True))
+
+        # == 文件引用按钮（输入框旁）==
+        file_ref_btn = ft.IconButton(ft.Icons.ATTACH_FILE, icon_size=20, tooltip="引用文件（跳转到文件页面）", on_click=lambda e: (save_current_state(), show_files()))
+
+        main_column.controls.extend([header, ft.Row([sidebar, ft.Container(content=chat_list, expand=True)], expand=True, spacing=0), ft.Container(padding=layout["padding"], content=ft.Column([ref_chips, quick_bar, ft.Row([file_ref_btn, chat_input, send_btn], spacing=layout["spacing"])], spacing=layout["spacing"])), nav_bar(colors)])
         page.update()
         update_session_info()
-        load_quick_prompts()
         load_chat()
+        update_ref_chips()
+        refresh_sidebar()
 
     def clear_chat():
         def do_clear():
@@ -524,14 +1248,23 @@ def main(page: ft.Page):
             if is_image(fp): items.append(ft.PopupMenuItem(content="打开图片", on_click=lambda e: open_file(fp)))
             elif is_binary(fp):
                 items.append(ft.PopupMenuItem(content="二进制文件", disabled=True))
-                items.append(ft.PopupMenuItem(content="打开所在文件夹", on_click=lambda e: os.startfile(os.path.dirname(fp))))
             else: items.append(ft.PopupMenuItem(content="打开", on_click=lambda e: open_file(fp)))
-            items.append(ft.PopupMenuItem(content="复制路径", on_click=lambda e: page.set_clipboard(fp) or show_toast(page, "已复制路径")))
-            items.append(ft.PopupMenuItem(content="引用到聊天", on_click=lambda e: add_ref_file(fp)))
+            items.append(ft.PopupMenuItem(content="打开所在文件夹", on_click=lambda e: subprocess.Popen(['explorer', os.path.dirname(fp)])))
+            items.append(ft.PopupMenuItem(content="引用到聊天", on_click=lambda e, p=fp: on_ref_file(p)))
+            items.append(ft.PopupMenuItem(content="引用并返回聊天", on_click=lambda e, p=fp: (on_ref_file(p), save_current_state(), show_chat())))
             return ft.PopupMenuButton(items=items, icon=ft.Icons.MORE_VERT, icon_size=16)
 
+        def on_ref_file(p):
+            ok, msg = add_ref_file(p)
+            if ok:
+                show_toast(page, f"已引用: {os.path.basename(p)} ({os.path.getsize(p):,} 字节)")
+            else:
+                show_toast(page, msg)
+            load_files(state["current_path"])
+
         def make_file_row(filename, fp, icon, icon_color):
-            return ft.Container(padding=6, border_radius=4, bgcolor=colors["card"], content=ft.Row([ft.Icon(icon, size=16, color=icon_color), ft.Text(filename, size=13, color=colors["text"], expand=True), make_file_popup(filename, fp)], spacing=5), on_click=lambda e, p=fp: open_file(p))
+            is_refed = any(rf["path"] == fp for rf in state["ref_files"])
+            return ft.Container(padding=6, border_radius=4, bgcolor=colors["selected"] if is_refed else colors["card"], content=ft.Row([ft.Icon(icon, size=16, color=icon_color), ft.Text(filename, size=13, color=colors["text"], expand=True), ft.Text("已引用", size=10, color=ft.Colors.GREEN) if is_refed else ft.Text(""), make_file_popup(filename, fp)], spacing=5), on_click=lambda e, p=fp: open_file(p))
 
         def load_files(path=""):
             nonlocal current_file_path
@@ -582,13 +1315,18 @@ def main(page: ft.Page):
         def save_current_file(e):
             nonlocal current_file_path
             if not current_file_path: show_toast(page, "请先选择文件"); return
-            if file_content.read_only: page.set_clipboard(current_file_path); show_toast(page, "已复制文件路径"); return
+            if file_content.read_only: page.clipboard.set(current_file_path); show_toast(page, "已复制文件路径"); return
             result = write_file(current_file_path, file_content.value)
             if result is True: show_toast(page, "已保存")
             else: show_toast(page, f"保存失败: {result}")
 
         save_copy_btn = ft.Button("保存", on_click=save_current_file)
-        file_content_wrapper.controls = [ft.Row([save_copy_btn, ft.Text("", expand=True), ft.IconButton(ft.Icons.COPY, icon_size=16, tooltip="复制内容", on_click=lambda e: (page.set_clipboard(file_content.value) or show_toast(page, "已复制")) if file_content.value else None)], spacing=8), file_content]
+        ref_and_back_btn = ft.Button("引用并返回聊天", on_click=lambda e: (
+            add_ref_file(current_file_path) if current_file_path else None,
+            save_current_state(),
+            show_chat()
+        ), bgcolor=ft.Colors.BLUE_200)
+        file_content_wrapper.controls = [ft.Row([save_copy_btn, ref_and_back_btn, ft.Text("", expand=True), ft.IconButton(ft.Icons.COPY, icon_size=16, tooltip="复制内容", on_click=lambda e: (page.clipboard.set(file_content.value) or show_toast(page, "已复制")) if file_content.value else None)], spacing=8), file_content]
         main_column.controls.extend([ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Icon(ft.Icons.FOLDER, color=colors["primary"]), file_path_input], spacing=8)), ft.Row([ft.Container(content=ft.Column([ft.Text("文件列表", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), file_list], spacing=5), width=layout["file_width"], padding=8), ft.Container(content=ft.Column([file_preview, file_content_wrapper], spacing=5), expand=True, padding=8)], expand=True, spacing=0), nav_bar(colors)])
         page.update()
         load_files(state["current_path"])
@@ -713,6 +1451,34 @@ def main(page: ft.Page):
 
         api_key_input = ft.TextField(label="API Key", password=True, value=state["api_key"], expand=True, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="sk-...", hint_style=ft.TextStyle(color=colors["text_hint"]))
         model_dropdown = ft.Dropdown(label="模型", value=state["model"], options=[ft.dropdown.Option("deepseek-v4-flash"), ft.dropdown.Option("deepseek-v4-pro")], border=ft.InputBorder.OUTLINE, color=colors["text"])
+
+        # ===== 自动保存函数 =====
+        def auto_save_settings():
+            """自动保存设置到文件（不含 API Key）"""
+            save_data = {k: state[k] for k in ["model", "theme_mode", "system_prompt", "quick_prompts", "agent_role", "agent_roles", "max_context_tokens", "max_tokens", "temperature", "thinking_enabled", "reasoning_effort", "mcp_enabled"]}
+            save_data["theme_mode"] = save_data["theme_mode"].value if hasattr(save_data["theme_mode"], 'value') else save_data["theme_mode"]
+            try:
+                with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                    json.dump(save_data, f, ensure_ascii=False, indent=2)
+            except: pass
+
+        def on_api_key_change(e):
+            key = api_key_input.value.strip()
+            state["api_key"] = key
+            if key and check_api_key(key):
+                try:
+                    state["client"] = OpenAI(api_key=key, base_url="https://api.deepseek.com/v1") if OpenAI else None
+                except: pass
+                _save_secure_api_key(key)  # 自动加密保存
+            else:
+                state["client"] = None
+                _save_secure_api_key("")  # 清空加密存储
+        api_key_input.on_change = on_api_key_change
+
+        def on_model_change(e):
+            state["model"] = model_dropdown.value
+            auto_save_settings()
+        model_dropdown.on_change = on_model_change
         
         # Agent 角色/场景（可自定义）
         role_names = list(state.get("agent_roles", DEFAULT_AGENT_ROLES).keys())
@@ -721,33 +1487,47 @@ def main(page: ft.Page):
         def on_role_change(e):
             role = role_dropdown.value
             state["agent_role"] = role
-            roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
-            prompt = roles.get(role, get_default_system_prompt())
-            system_prompt_input.value = prompt
+            system_prompt_input.value = get_role_prompt(role)
+            auto_save_settings()
             page.update()
         role_dropdown.on_change = on_role_change
 
         def load_role_list_ui():
             role_list.controls.clear()
             roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
-            for i, (rname, rprompt) in enumerate(roles.items()):
-                role_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text(f"{i+1}. {rname}", size=13, weight=ft.FontWeight.W_500, color=colors["text"]), ft.Text(rprompt[:50] + "..." if len(rprompt) > 50 else rprompt, size=11, color=colors["text_hint"])], spacing=2, expand=True), ft.IconButton(ft.Icons.EDIT, icon_size=16, tooltip="编辑", on_click=lambda e, idx=i: edit_role(idx)), ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="删除", on_click=lambda e, idx=i: delete_role(idx))], spacing=5)))
+            for i, (rname, role_data) in enumerate(roles.items()):
+                if isinstance(role_data, dict):
+                    rprompt = role_data.get("prompt", "")
+                    rskills = role_data.get("skills", [])
+                else:
+                    rprompt = role_data
+                    rskills = []
+                skills_str = " | ".join(rskills) if rskills else "无技能"
+                role_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text(f"{i+1}. {rname}", size=13, weight=ft.FontWeight.W_500, color=colors["text"]), ft.Text(f"技能: {skills_str}", size=11, color=colors["text_hint"])], spacing=2, expand=True), ft.IconButton(ft.Icons.EDIT, icon_size=16, tooltip="编辑", on_click=lambda e, idx=i: edit_role(idx)), ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="删除", on_click=lambda e, idx=i: delete_role(idx))], spacing=5)))
             page.update()
 
         def edit_role(idx):
             roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
             rname = list(roles.keys())[idx]
-            rprompt = roles[rname]
+            role_data = roles[rname]
+            if isinstance(role_data, dict):
+                rprompt = role_data.get("prompt", "")
+                rskills = ",".join(role_data.get("skills", []))
+            else:
+                rprompt = role_data
+                rskills = ""
             ni = ft.TextField(label="名称", value=rname, border=ft.InputBorder.OUTLINE)
             pi = ft.TextField(label="提示词", value=rprompt, multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("编辑角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.Button("保存")])
+            si = ft.TextField(label="技能 (逗号分隔)", value=rskills, border=ft.InputBorder.OUTLINE, hint_text="例如: 代码审查,找Bug,写注释")
+            dlg = ft.AlertDialog(title=ft.Text("编辑角色"), content=ft.Column([ni, pi, si], spacing=10), actions=[ft.TextButton("取消"), ft.Button("保存")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (
                 setattr(dlg, 'open', False) or
                 (ni.value.strip() and pi.value.strip() and (
                     (ni.value.strip() != rname and ni.value.strip() not in roles) or ni.value.strip() == rname
                 ) and (
-                    roles.pop(rname, None), roles.__setitem__(ni.value.strip(), pi.value.strip())
+                    roles.pop(rname, None),
+                    roles.__setitem__(ni.value.strip(), {"prompt": pi.value.strip(), "skills": [s.strip() for s in si.value.split(",") if s.strip()]})
                 ) or True) or update_role_ui())
             show_dialog(page, dlg)
 
@@ -764,12 +1544,13 @@ def main(page: ft.Page):
         def add_role(e):
             ni = ft.TextField(label="名称", hint_text="例如: 辩论手", border=ft.InputBorder.OUTLINE)
             pi = ft.TextField(label="提示词", hint_text="你是一位...", multiline=True, min_lines=3, border=ft.InputBorder.OUTLINE)
-            dlg = ft.AlertDialog(title=ft.Text("新增角色"), content=ft.Column([ni, pi], spacing=10), actions=[ft.TextButton("取消"), ft.Button("添加")])
+            si = ft.TextField(label="技能 (逗号分隔)", hint_text="例如: 辩论,反驳,论证", border=ft.InputBorder.OUTLINE)
+            dlg = ft.AlertDialog(title=ft.Text("新增角色"), content=ft.Column([ni, pi, si], spacing=10), actions=[ft.TextButton("取消"), ft.Button("添加")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
             dlg.actions[1].on_click = lambda e: (
                 setattr(dlg, 'open', False) or
                 (ni.value.strip() and pi.value.strip() and ni.value.strip() not in state.setdefault("agent_roles", {}) and
-                 state["agent_roles"].__setitem__(ni.value.strip(), pi.value.strip()) or True) or update_role_ui())
+                 state["agent_roles"].__setitem__(ni.value.strip(), {"prompt": pi.value.strip(), "skills": [s.strip() for s in si.value.split(",") if s.strip()]}) or True) or update_role_ui())
             show_dialog(page, dlg)
 
         def update_role_ui():
@@ -779,37 +1560,103 @@ def main(page: ft.Page):
             page.update()
 
         system_prompt_input = ft.TextField(label="系统提示词 (System Prompt)", value=state["system_prompt"], expand=True, multiline=True, min_lines=4, max_lines=8, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="设置AI助手的默认行为和约束...", hint_style=ft.TextStyle(color=colors["text_hint"]))
+        def on_system_prompt_blur(e):
+            state["system_prompt"] = system_prompt_input.value.strip()
+            # 同步更新当前会话的 system prompt 并保存
+            if state["messages"] and state["messages"][0].get("role") == "system":
+                state["messages"][0]["content"] = state["system_prompt"]
+                save_msgs(state["current_session"], state["messages"])
+            auto_save_settings()
+        system_prompt_input.on_blur = on_system_prompt_blur
         quick_prompts_list = ft.ListView(expand=True, spacing=5)
 
-        # 上下文长度控制
-        context_slider = ft.Slider(min=4000, max=64000, divisions=15, value=state.get("max_context_tokens", 32000), label="{value}")
-        context_label = ft.Text(f"最大上下文: {state.get('max_context_tokens', 32000)} tokens", size=12, color=colors["text"])
+        # 上下文长度控制（手动输入 + 参考上限 + 字数换算）
+        context_input = ft.TextField(label="最大上下文 (tokens)", value=str(state.get("max_context_tokens", 32000)), border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="推荐 32000~128000", hint_style=ft.TextStyle(color=colors["text_hint"]), width=200)
+        context_hint = ft.Text("≈ 中文: 约 2.1万字 | 英文: 约 8k词 | 上限: 128K", size=11, color=colors["text_hint"])
+        context_unit = ft.Text("Token 换算: 1 token ≈ 0.7 中文字 ≈ 0.3 英文单词 | 中文: tokens÷0.7≈字数 | 英文: tokens÷0.3≈词数", size=10, color=colors["text_hint"])
         def on_context_change(e):
-            v = int(context_slider.value)
-            state["max_context_tokens"] = v
-            context_label.value = f"最大上下文: {v} tokens"
-            page.update()
-        context_slider.on_change = on_context_change
+            try:
+                v = int(context_input.value.strip())
+                if v < 1000: v = 1000
+                if v > 128000: v = 128000
+                state["max_context_tokens"] = v
+                context_input.value = str(v)
+                cn = int(v * 0.7)
+                en = int(v * 0.3)
+                context_hint.value = f"≈ 中文: 约 {cn/10000:.1f}万字 | 英文: 约 {en/1000:.0f}k词 | 上限: 128K"
+                auto_save_settings()
+                page.update()
+            except: pass
+        context_input.on_change = on_context_change
 
-        # 回复长度控制
-        max_tokens_slider = ft.Slider(min=100, max=16384, divisions=32, value=state.get("max_tokens", 2048), label="{value}")
-        max_tokens_label = ft.Text(f"最大回复长度: {state.get('max_tokens', 2048)} tokens", size=12, color=colors["text"])
+        # 回复长度控制（手动输入 + 参考上限 + 字数换算）
+        max_tokens_input = ft.TextField(label="最大回复长度 (tokens)", value=str(state.get("max_tokens", 2048)), border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="推荐 512~16384", hint_style=ft.TextStyle(color=colors["text_hint"]), width=200)
+        max_tokens_hint = ft.Text("≈ 中文: 约 1433字 | 英文: 约 614词 | 上限: 16K", size=11, color=colors["text_hint"])
         def on_max_tokens_change(e):
-            v = int(max_tokens_slider.value)
-            state["max_tokens"] = v
-            max_tokens_label.value = f"最大回复长度: {v} tokens"
-            page.update()
-        max_tokens_slider.on_change = on_max_tokens_change
+            try:
+                v = int(max_tokens_input.value.strip())
+                if v < 100: v = 100
+                if v > 16384: v = 16384
+                state["max_tokens"] = v
+                max_tokens_input.value = str(v)
+                cn = int(v * 0.7)
+                en = int(v * 0.3)
+                max_tokens_hint.value = f"≈ 中文: 约 {cn}字 | 英文: 约 {en}词 | 上限: 16K"
+                auto_save_settings()
+                page.update()
+            except: pass
+        max_tokens_input.on_change = on_max_tokens_change
 
-        # 深度思考开关
-        temperature_switch = ft.Switch(value=state.get("temperature", 0.7) > 0.5, label="深度思考模式", label_position=ft.LabelPosition.RIGHT)
-        temperature_label = ft.Text(f"当前温度: {state.get('temperature', 0.7)}", size=12, color=colors["text"])
-        def on_temperature_change(e):
-            v = 0.9 if temperature_switch.value else 0.3
-            state["temperature"] = v
-            temperature_label.value = f"当前温度: {v}"
+        # 深度思考开关（设置页）
+        thinking_switch = ft.Switch(value=state.get("thinking_enabled", False), label="深度思考模式", label_position=ft.LabelPosition.RIGHT)
+        thinking_label = ft.Text("", size=12, color=colors["text"])
+        def update_thinking_label():
+            if state.get("thinking_enabled", False):
+                ef = state.get("reasoning_effort", "high")
+                thinking_label.value = f"开启 (reasoning_effort={ef})，温度等参数不生效"
+            else:
+                thinking_label.value = f"关闭，使用温度: {state.get('temperature', 0.7)}"
+        update_thinking_label()
+        def on_thinking_change(e):
+            state["thinking_enabled"] = thinking_switch.value
+            update_thinking_label()
+            auto_save_settings()
             page.update()
-        temperature_switch.on_change = on_temperature_change
+        thinking_switch.on_change = on_thinking_change
+
+        # 温度调节（仅思考模式关闭时生效）
+        temperature_slider = ft.Slider(value=state.get("temperature", 0.7), min=0.1, max=2.0, divisions=19, label="{value}", width=200)
+        temperature_value = ft.Text(f"{state.get('temperature', 0.7)}", size=12, color=colors["text"])
+        def on_temp_slider_change(e):
+            state["temperature"] = temperature_slider.value
+            temperature_value.value = f"{temperature_slider.value}"
+            update_thinking_label()
+            auto_save_settings()
+            page.update()
+        temperature_slider.on_change = on_temp_slider_change
+
+        # MCP 工具开关（默认关闭）
+        mcp_switch = ft.Switch(value=state.get("mcp_enabled", False), label="MCP 工具集成", label_position=ft.LabelPosition.RIGHT)
+        mcp_label = ft.Text("", size=12, color=colors["text"])
+        def update_mcp_label():
+            if state.get("mcp_enabled", False):
+                mcp_count = sum(1 for t in TOOLS if t.get("function", {}).get("name", "").startswith("mcp_"))
+                mcp_label.value = f"开启 (已加载 {mcp_count} 个 MCP 工具，与 Trae IDE 共用配置)"
+                mcp_label.color = ft.Colors.GREEN
+            else:
+                mcp_label.value = "关闭（不加载 MCP 工具，仅使用内置工具）"
+                mcp_label.color = colors["text_hint"]
+        update_mcp_label()
+        def on_mcp_change(e):
+            state["mcp_enabled"] = mcp_switch.value
+            if state["mcp_enabled"]:
+                _enable_mcp()
+            else:
+                _disable_mcp()
+            update_mcp_label()
+            auto_save_settings()
+            page.update()
+        mcp_switch.on_change = on_mcp_change
 
         def load_quick_prompts_ui():
             quick_prompts_list.controls.clear()
@@ -837,48 +1684,66 @@ def main(page: ft.Page):
             dlg.actions[1].on_click = lambda e: (setattr(dlg, 'open', False) or (li.value.strip() and ti.value.strip() and state["quick_prompts"].append((li.value.strip(), ti.value.strip())) or True) or load_quick_prompts_ui() or page.update())
             show_dialog(page, dlg)
 
-        balance_text = ft.Text("", size=13, color=colors["text"])
+        balance_text = ft.Text(state.get("balance_result", ""), size=13, color=colors["text"])
         balance_btn = ft.Button("查询余额")
-        conn_status_text = ft.Text("", size=12, color=colors["text"])
+        conn_status_text = ft.Text(state.get("conn_result", ""), size=12, color=colors["text"])
         conn_test_btn = ft.Button("测试连接")
 
         def check_balance(e):
             if not state["api_key"]: show_toast(page, "请先设置 API Key"); return
             balance_text.value = "查询中..."; balance_btn.disabled = True; page.update()
-            import threading
-            def do_query():
-                import requests
-                try:
-                    r = requests.get("https://api.deepseek.com/user/balance", headers={"Authorization": f"Bearer {state['api_key']}", "Accept": "application/json"}, timeout=10)
-                    if r.status_code == 200:
-                        data = r.json()
-                        bal = data.get("balance_infos", [])
-                        if bal:
-                            total = sum(float(b.get("total_balance", 0)) for b in bal)
-                            balance_text.value = f"余额: ¥{total:.2f}"; balance_text.color = ft.Colors.GREEN
-                        else: balance_text.value = f"余额信息: {data}"
-                    else: balance_text.value = f"查询失败: HTTP {r.status_code}"
-                except Exception as ex: balance_text.value = f"查询失败: {ex}"
-                balance_btn.disabled = False; page.update()
-            threading.Thread(target=do_query, daemon=True).start()
+            page.run_task(_do_check_balance)
+
+        async def _do_check_balance():
+            import requests
+            loop = asyncio.get_running_loop()
+            try:
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: requests.get(
+                        "https://api.deepseek.com/user/balance",
+                        headers={"Authorization": f"Bearer {state['api_key']}", "Accept": "application/json"},
+                        timeout=10
+                    )
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    bal = data.get("balance_infos", [])
+                    if bal:
+                        total = sum(float(b.get("total_balance", 0)) for b in bal)
+                        balance_text.value = f"余额: ¥{total:.2f}"; balance_text.color = ft.Colors.GREEN
+                    else: balance_text.value = f"余额信息: {data}"
+                else: balance_text.value = f"查询失败: HTTP {r.status_code}"
+            except Exception as ex: balance_text.value = f"查询失败: {ex}"
+            balance_btn.disabled = False
+            state["balance_result"] = balance_text.value
+            page.update()
         balance_btn.on_click = check_balance
 
         def test_connectivity(e):
             if not state["api_key"]: show_toast(page, "请先设置 API Key"); return
-            if not state["client"]: show_toast(page, "请先保存设置"); return
+            if not state["client"]: show_toast(page, "客户端未初始化，请检查 API Key 格式"); return
             conn_status_text.value = "测试中..."; conn_status_text.color = ft.Colors.GREY; conn_test_btn.disabled = True; page.update()
-            import threading
-            def do_test():
-                try:
-                    r = state["client"].chat.completions.create(model=state["model"], messages=[{"role": "user", "content": "ping"}], max_tokens=1)
-                    if r:
-                        conn_status_text.value = "✓ 连接成功"; conn_status_text.color = ft.Colors.GREEN
-                    else:
-                        conn_status_text.value = "✗ 连接失败"; conn_status_text.color = ft.Colors.RED
-                except Exception as ex:
-                    conn_status_text.value = f"✗ 连接失败: {str(ex)[:30]}"; conn_status_text.color = ft.Colors.RED
-                conn_test_btn.disabled = False; page.update()
-            threading.Thread(target=do_test, daemon=True).start()
+            page.run_task(_do_test_connectivity)
+
+        async def _do_test_connectivity():
+            loop = asyncio.get_running_loop()
+            try:
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: state["client"].chat.completions.create(
+                        model=state["model"], messages=[{"role": "user", "content": "ping"}], max_tokens=1
+                    )
+                )
+                if r:
+                    conn_status_text.value = "✓ 连接成功"; conn_status_text.color = ft.Colors.GREEN
+                else:
+                    conn_status_text.value = "✗ 连接失败"; conn_status_text.color = ft.Colors.RED
+            except Exception as ex:
+                conn_status_text.value = f"✗ 连接失败: {str(ex)[:30]}"; conn_status_text.color = ft.Colors.RED
+            conn_test_btn.disabled = False
+            state["conn_result"] = conn_status_text.value
+            page.update()
         conn_test_btn.on_click = test_connectivity
 
         def clear_cache(e):
@@ -904,6 +1769,9 @@ def main(page: ft.Page):
                 if os.path.exists(SETTINGS_PATH):
                     try: os.remove(SETTINGS_PATH)
                     except: pass
+                if os.path.exists(SECURE_KEY_PATH):
+                    try: os.remove(SECURE_KEY_PATH)
+                    except: pass
                 state["api_key"] = ""; state["client"] = None
                 state["current_session"] = ""; state["messages"] = []
                 state["system_prompt"] = get_default_system_prompt()
@@ -924,9 +1792,8 @@ def main(page: ft.Page):
                 show_toast(page, f"初始化客户端失败: {ex}")
                 return
 
-            save_data = {k: state[k] for k in ["model", "theme_mode", "system_prompt", "quick_prompts", "agent_role", "agent_roles", "max_context_tokens", "max_tokens", "temperature"]}
-            save_data["theme_mode"] = save_data["theme_mode"].value if hasattr(save_data["theme_mode"], 'value') else save_data["theme_mode"]
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f: json.dump(save_data, f, ensure_ascii=False, indent=2)
+            auto_save_settings()
+            _save_secure_api_key(state["api_key"])  # 加密保存 API Key
 
             if state["api_key"]:
                 import threading
@@ -947,14 +1814,21 @@ def main(page: ft.Page):
             ft.Row([balance_btn, balance_text], spacing=10),
             ft.Row([conn_test_btn, conn_status_text], spacing=10),
             ft.Text("系统提示词", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), system_prompt_input,
-            context_label, context_slider,
-            max_tokens_label, max_tokens_slider,
-            ft.Row([temperature_switch, temperature_label], spacing=10),
+            context_input, context_hint, context_unit,
+            max_tokens_input, max_tokens_hint,
+            ft.Row([thinking_switch, thinking_label], spacing=10),
+            ft.Container(padding=ft.Padding.only(left=20, top=2, bottom=2), content=ft.Text("思考模式开启时 API 先返回推理链（reasoning_content），再返回最终答案。开启后 temperature/top_p 等参数不生效。", size=10, color=colors["text_hint"], italic=True)),
+            ft.Row([ft.Text("温度", size=12, color=colors["text_hint"]), temperature_slider, temperature_value], spacing=8),
+            ft.Container(padding=ft.Padding.only(left=20, top=2, bottom=2), content=ft.Text("温度控制输出随机性（0.1~2.0）。低值输出更确定/稳定，高值输出更有创造性。仅思考模式关闭时生效。", size=10, color=colors["text_hint"], italic=True)),
+            ft.Divider(),
+            ft.Text("MCP 工具集成", size=14, weight=ft.FontWeight.W_500, color=colors["text"]),
+            ft.Row([mcp_switch, mcp_label], spacing=10),
+            ft.Container(padding=ft.Padding.only(left=20, top=2, bottom=2), content=ft.Text("与 Trae IDE 共用 MCP 服务器配置。需要 npx 可用，启动时自动检测已安装的 MCP 服务器。", size=10, color=colors["text_hint"], italic=True)),
             ft.Divider(),
             ft.Row([ft.Text("快捷提示词", size=14, weight=ft.FontWeight.W_500, color=colors["text"]), ft.IconButton(ft.Icons.ADD, icon_size=18, tooltip="添加", on_click=add_quick_prompt)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             quick_prompts_list,
             ft.Row([ft.Button("保存设置", on_click=save_settings, width=140), ft.Button("清理会话", on_click=clear_cache, width=140, bgcolor=ft.Colors.RED_200)], spacing=8),
-            ft.Row([ft.Button("清除所有数据", on_click=clear_all_data, width=200, bgcolor=ft.Colors.RED), ft.IconButton(ft.Icons.FOLDER_OPEN, icon_size=18, tooltip="打开数据文件夹", on_click=lambda e: os.startfile(APP_DIR))], spacing=8),
+            ft.Row([ft.Button("清除所有数据", on_click=clear_all_data, width=200, bgcolor=ft.Colors.RED), ft.IconButton(ft.Icons.FOLDER_OPEN, icon_size=18, tooltip="打开数据文件夹", on_click=lambda e: subprocess.Popen(['explorer', APP_DIR]))], spacing=8),
             ft.Text(f"数据目录: {APP_DIR}", size=10, color=colors["text_hint"]),
             ft.Divider(), ft.Text("DeepSeek Agent", size=12, color=colors["text_hint"]),
             ft.TextButton("GitHub: https://github.com/FDLAlfrid/dsa_acd", icon=ft.Icons.OPEN_IN_NEW, on_click=lambda e: page.launch_url("https://github.com/FDLAlfrid/dsa_acd"), style=ft.ButtonStyle(padding=0, color=colors["primary"]))
