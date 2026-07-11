@@ -17,7 +17,7 @@ A cross-platform desktop AI agent powered by DeepSeek API, built with Flet.
 ## Setup
 
 ```bash
-pip install flet openai requests
+pip install -r requirements.txt
 python main.py
 ```
 
@@ -26,6 +26,7 @@ python main.py
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
+  --hidden-import=flet_desktop ^
   --exclude-module=PyQt5 --exclude-module=PyQt6 ^
   --exclude-module=tkinter --exclude-module=matplotlib ^
   # Add other modules to exclude here, the line above is an example of what to exclude
@@ -38,7 +39,7 @@ For minimal size, use a clean virtual environment:
 python -m venv venv
 venv\Scripts\activate  # Windows
 # source venv/bin/activate  # macOS/Linux
-pip install flet openai requests
+pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
 ```
@@ -48,7 +49,7 @@ Or with Conda:
 ```bash
 conda create -n deepseek_agent python=3.10
 conda activate deepseek_agent
-pip install flet openai requests
+pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
 ```
@@ -96,7 +97,7 @@ GPL 3.0
 ## 安装运行
 
 ```bash
-pip install flet openai requests
+pip install -r requirements.txt
 python main.py
 ```
 
@@ -105,6 +106,7 @@ python main.py
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
+  --hidden-import=flet_desktop ^
   --exclude-module=PyQt5 --exclude-module=PyQt6 ^
   #这里可以添加其他需要排除的模块，上一行是举例
   main.py
@@ -116,7 +118,7 @@ pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
 python -m venv venv
 venv\Scripts\activate  # Windows
 # source venv/bin/activate  # macOS/Linux
-pip install flet openai requests
+pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
 ```
@@ -126,7 +128,7 @@ pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
 ```bash
 conda create -n deepseek_agent python=3.10
 conda activate deepseek_agent
-pip install flet openai requests
+pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
 ```
