@@ -1,6 +1,6 @@
 <div align="right">🌐 <a href="#deepseek-agent">English</a> · <a href="#deepseek-agent-中文">中文</a></div>
 
-# DeepSeek Agent
+# DeepSeek Agent v0.1.1
 
 A cross-platform desktop AI agent powered by DeepSeek API, built with Flet.
 Supports function calling with MCP tool integration, co-sharing MCP server configs with Trae IDE.
@@ -55,54 +55,34 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Build EXE
+## Build EXE (v0.1.1)
+
+> **重要**：打包前必须先激活 conda 环境（或 venv），否则 PyInstaller 会打包错误的依赖。
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico ^
-  --hidden-import=flet_desktop ^
-  --exclude-module=PyQt5 --exclude-module=PyQt6 ^
-  --exclude-module=tkinter --exclude-module=matplotlib ^
-  # Add other modules to exclude here, the line above is an example of what to exclude
-  main.py
-```
+# 1. 激活环境
+conda activate deepseek_agent      # Conda 用户
+# 或 venv\Scripts\activate         # venv 用户
 
-For minimal size, use a clean virtual environment:
+# 2. 安装依赖
+pip install flet openai requests pyinstaller
 
-```bash
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # macOS/Linux
-pip install -r requirements.txt
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
-```
-
-Or with Conda:
-
-```bash
-conda create -n deepseek_agent python=3.10
-conda activate deepseek_agent
-pip install -r requirements.txt
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "DeepSeekAgent" --icon=icon.ico main.py
-```
-
-### About PyInstaller Module Selection
-
-PyInstaller uses **blacklist exclusion** (`--exclude-module`) because Python's dependency resolution is complex — packages often have implicit dependencies that aren't directly imported. A whitelist approach would miss these and cause runtime errors.
-
-For precise control, use a **spec file**:
-
-```bash
-pyinstaller --name "DeepSeekAgent" --icon=icon.ico main.py --specpath .
-```
-
-Edit `DeepSeekAgent.spec` to customize `excludes`, `hiddenimports`, and `datas`, then:
-
-```bash
+# 3. 一键打包
 pyinstaller DeepSeekAgent.spec
 ```
+
+### 版本号修改
+
+EXE 版本号由 `version_info.txt` 控制，打包后右键 EXE → 属性 → 详细信息可见。修改时只需改 **3 处**：
+
+| 位置 | 说明 | 示例 |
+|------|------|------|
+| `filevers=(1, 0, 0, 0)` | 文件版本（4 位元组） | 改 `(1, 1, 0, 0)` |
+| `prodvers=(1, 0, 0, 0)` | 产品版本（同上） | 改 `(1, 1, 0, 0)` |
+| `StringStruct(u'FileVersion', u'1.0.0')` | 文件版本字符串 | 改 `u'1.1.0'` |
+| `StringStruct(u'ProductVersion', u'1.0.0')` | 产品版本字符串 | 改 `u'1.1.0'` |
+
+同时同步修改 `main.py` 中的 `VERSION = "1.0.0"` 常量（窗口标题栏显示）。
 
 ## Data Directory
 
@@ -114,7 +94,7 @@ GPL 3.0
 
 ---
 
-# DeepSeek Agent 中文
+# DeepSeek Agent v0.1.1 中文
 
 基于 DeepSeek API 的跨平台桌面 AI 助手，使用 Flet 构建。
 支持函数调用和 MCP 工具集成，与 Trae IDE 共用 MCP 服务器配置。
