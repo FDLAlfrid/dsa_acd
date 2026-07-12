@@ -1,7 +1,26 @@
 import flet as ft
-import os, json, time, gc, base64, re, subprocess, sys, platform, shutil, threading, asyncio
+import os, json, time, gc, base64, re, subprocess, sys, platform, shutil, threading, asyncio, hashlib, socket, getpass, requests
 try: from openai import OpenAI
 except: OpenAI = None
+
+VERSION = "0.1.1"
+APP_NAME = "DeepSeek Agent"
+APP_DIR = os.path.join(os.path.expanduser("~"), ".deepseek_sessions")
+SESSION_DIR = os.path.join(APP_DIR, "sessions")
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+SECURE_KEY_PATH = os.path.join(APP_DIR, "secure_key.dat")
+MEMORY_DIR = os.path.join(APP_DIR, "memory")  # 长记忆池目录
+
+# CJK 字体：确保中文符号（顿号、引号等）正确渲染
+if platform.system() == "Windows":
+    FONT_CJK = "Microsoft YaHei"
+elif platform.system() == "Darwin":
+    FONT_CJK = "PingFang SC"
+else:
+    FONT_CJK = "Noto Sans CJK SC"
+
+os.makedirs(SESSION_DIR, exist_ok=True)
+os.makedirs(MEMORY_DIR, exist_ok=True)
 
 if platform.system() == "Windows":
     try:
@@ -183,16 +202,8 @@ def _shutdown_mcp():
         _mcp_tools.clear()
 # ============================================================
 
-APP_DIR = os.path.expanduser("~/.deepseek_sessions")
-SESSION_DIR = os.path.join(APP_DIR, "sessions")
-SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
-SECURE_KEY_PATH = os.path.join(APP_DIR, "secure_key.dat")
-for d in [APP_DIR, SESSION_DIR]: os.makedirs(d, exist_ok=True)
-
-# ============================================================
 # API Key 安全存储（机器绑定加密）
 # ============================================================
-import hashlib, socket, getpass
 
 def _derive_machine_key():
     """基于机器信息派生加密密钥（同机器可解密，不同机器无法解密）"""
@@ -249,32 +260,40 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg"}
 
 DEFAULT_AGENT_ROLES = {
     "通用助手": {
-        "prompt": "你是一个AI助手，可以读写本地文件、运行命令，请按用户指令操作。",
+        "prompt": "你是一个通用AI助手，可以读写本地文件、运行命令、调用工具。请按用户指令操作，用中文回复。",
         "skills": ["总结内容", "翻译成中文", "解释概念"],
     },
     "编程专家": {
-        "prompt": "你是一位资深程序员，擅长代码编写、调试、重构和技术方案设计。回复要专业、准确，提供可运行的代码示例。",
-        "skills": ["代码审查", "找Bug", "性能优化", "重构代码", "写注释", "写测试"],
+        "prompt": "你是一位资深全栈程序员，精通 Python/JavaScript/Go/Rust/Java/C++ 等主流语言。\n\n你的工作方式：\n1. 先理解用户需求，必要时主动提问澄清\n2. 编写可运行、可维护的代码，附带关键注释\n3. 指出潜在的性能、安全、兼容性问题\n4. 代码示例要完整，不要省略关键部分\n\n回复用中文，代码用英文。",
+        "skills": ["代码审查", "找Bug", "性能优化", "重构代码", "写注释", "写测试", "解释代码"],
     },
     "翻译官": {
-        "prompt": "你是一位专业翻译，精通中英文互译。请保持原文风格和语气，专业术语要准确。只返回译文，不需要解释。",
-        "skills": ["中译英", "英译中", "润色中文"],
+        "prompt": "你是一位专业翻译，精通中英互译，也支持日/韩/法/德/西等主要语言。\n\n翻译规则：\n1. 保持原文风格、语气和结构\n2. 专业术语准确，不随意意译\n3. 只返回译文，不添加解释（除非用户要求）\n4. 遇到歧义时标注多种可能译法",
+        "skills": ["中译英", "英译中", "多语言翻译", "润色中文"],
     },
     "写作助手": {
-        "prompt": "你是一位写作专家，擅长各类文书创作。包括文章、报告、邮件等。注意语言的流畅性和逻辑性。",
-        "skills": ["写文章", "写报告", "写邮件", "润色改写"],
+        "prompt": "你是一位写作专家，擅长各类文书创作：文章、报告、邮件、演讲稿、技术文档等。\n\n写作原则：\n1. 先确认目标读者和用途\n2. 结构清晰，逻辑连贯\n3. 语言流畅自然，避免生硬翻译腔\n4. 根据场景调整语气（正式/轻松/专业）\n5. 可主动提供改进建议",
+        "skills": ["写文章", "写报告", "写邮件", "润色改写", "扩写缩写"],
     },
     "代码审查员": {
-        "prompt": "你是一位严格的代码审查专家，每次审查要指出：1)潜在bug 2)性能问题 3)安全风险 4)可改进之处。",
-        "skills": ["代码审查", "安全审查", "性能分析"],
+        "prompt": "你是一位严格的代码审查专家，专注代码质量与安全。\n\n审查清单（每次必查）：\n1. 潜在 Bug：空指针、边界条件、并发问题\n2. 性能问题：不必要的循环、内存泄漏、N+1查询\n3. 安全风险：注入漏洞、敏感信息泄露、权限问题\n4. 可改进之处：命名、结构、可读性\n\n用「✅ 通过 / ⚠️ 建议 / ❌ 必须修复」标注每条意见。",
+        "skills": ["代码审查", "安全审查", "性能分析", "Bug定位"],
     },
     "数据分析师": {
-        "prompt": "你是一位数据分析专家，擅长数据解读、趋势分析和可视化建议。请用数据说话，给出 actionable 的洞察。",
-        "skills": ["数据分析", "趋势解读", "可视化建议"],
+        "prompt": "你是一位数据分析专家，擅长数据解读、统计分析和可视化建议。\n\n分析流程：\n1. 先理解数据结构和业务背景\n2. 用统计方法发现规律和异常\n3. 给出 actionable 的洞察，不只是描述\n4. 建议合适的可视化方案（图表类型、工具）\n\n用数据说话，避免主观臆断。",
+        "skills": ["数据分析", "趋势解读", "可视化建议", "统计检验"],
     },
     "教师": {
-        "prompt": "你是一位耐心且知识渊博的老师。善于用简单的方式解释复杂概念，会通过提问引导用户思考。",
-        "skills": ["解释概念", "举例说明", "引导思考"],
+        "prompt": "你是一位耐心且知识渊博的老师，擅长用简单方式解释复杂概念。\n\n教学方法：\n1. 先用一句话概括核心概念\n2. 用类比和例子帮助理解\n3. 分层讲解：从简单到深入\n4. 提问引导用户思考，而非直接给答案\n5. 总结关键要点，便于记忆\n\n保持鼓励和耐心，让学生感到学习是有趣的。",
+        "skills": ["解释概念", "举例说明", "引导思考", "知识梳理"],
+    },
+    "产品经理": {
+        "prompt": "你是一位经验丰富的产品经理，擅长需求分析、功能设计和用户体验优化。\n\n工作方式：\n1. 先理解用户场景和痛点\n2. 分析竞品和行业最佳实践\n3. 设计清晰的功能规格和用户流程\n4. 评估优先级和实施难度\n5. 用结构化文档呈现（用户故事、验收标准、原型建议）\n\n平衡用户需求、技术可行性和商业价值。",
+        "skills": ["需求分析", "功能设计", "竞品分析", "PRD撰写", "用户体验"],
+    },
+    "DevOps工程师": {
+        "prompt": "你是一位DevOps/SRE工程师，精通CI/CD、容器化、云服务和自动化运维。\n\n专业领域：\n- Docker/K8s 容器编排\n- CI/CD 流水线（GitHub Actions, Jenkins, GitLab CI）\n- 云服务（AWS, Azure, GCP, 阿里云）\n- 监控和日志（Prometheus, Grafana, ELK）\n- IaC（Terraform, Ansible, Pulumi）\n\n回复要给出可执行的配置示例。",
+        "skills": ["CI/CD配置", "Docker编排", "K8s部署", "监控告警", "自动化脚本"],
     },
 }
 
@@ -331,10 +350,28 @@ def read_file(path):
     except PermissionError: return f"无权限读取: {path}"
     except Exception as ex: return f"读取失败: {path} - {str(ex)}"
 
-def write_file(path, content):
+def write_file(path, content, progress_callback=None):
+    """写入文件，支持进度回调。progress_callback(percent, written, total)"""
     try:
-        with open(path, "w", encoding="utf-8") as f: f.write(content); return True
-    except Exception as ex: return str(ex)
+        total = len(content)
+        if total > 512 * 1024 and progress_callback:
+            # 大于 512KB 时分块写入并报告进度
+            chunk_size = 64 * 1024  # 64KB per chunk
+            written = 0
+            with open(path, "w", encoding="utf-8") as f:
+                for i in range(0, total, chunk_size):
+                    chunk = content[i:i + chunk_size]
+                    f.write(chunk)
+                    written += len(chunk)
+                    progress_callback(int(written / total * 100), written, total)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            if progress_callback:
+                progress_callback(100, total, total)
+        return True
+    except Exception as ex:
+        return str(ex)
 
 def calc_tokens_count(msgs):
     """估算消息的总token数"""
@@ -419,6 +456,92 @@ def _disable_mcp():
 
 def get_default_system_prompt(): return "你是一个AI助手，可以读写本地文件、运行命令，请按用户指令操作。"
 
+# ============================================================
+# 长记忆池 - 对话摘要持久化
+# ============================================================
+def _memory_path(session_name): return os.path.join(MEMORY_DIR, f"{session_name}.json")
+
+def load_memory(session_name):
+    """加载会话的长记忆摘要"""
+    path = _memory_path(session_name)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {"summary": "", "key_points": [], "last_updated": ""}
+
+def save_memory(session_name, memory_data):
+    """保存会话的长记忆摘要"""
+    memory_data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(_memory_path(session_name), "w", encoding="utf-8") as f:
+            json.dump(memory_data, f, ensure_ascii=False, indent=2)
+    except: pass
+
+def build_context_with_memory(messages, session_name):
+    """构建带记忆的上下文：记忆摘要 + 最近N轮对话"""
+    memory = load_memory(session_name)
+    summary = memory.get("summary", "")
+    if not summary:
+        return messages  # 无记忆，直接返回原始消息
+
+    # 在系统消息后插入记忆上下文
+    result = []
+    for m in messages:
+        result.append(m)
+        if m["role"] == "system":
+            memory_msg = {"role": "system", "content": f"[历史对话摘要]\n{summary}\n\n[以上为之前对话的摘要，请结合以上上下文理解用户的后续问题]"}
+            result.append(memory_msg)
+            break
+    return result
+
+def auto_summarize_if_needed(session_name, messages):
+    """如果对话过长，自动生成摘要存入记忆池"""
+    # 超过 20 轮对话时触发摘要
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    if len(user_msgs) < 20: return
+
+    # 检查是否已有近期摘要（1小时内不重复生成）
+    memory = load_memory(session_name)
+    last_ts = memory.get("last_updated", "")
+    if last_ts:
+        try:
+            last_t = time.mktime(time.strptime(last_ts, "%Y-%m-%d %H:%M:%S"))
+            if time.time() - last_t < 3600: return
+        except: pass
+
+    # 异步生成摘要（不阻塞用户操作）
+    def do_summarize():
+        try:
+            if not state.get("client"): return
+            # 取前 2/3 的消息用于摘要
+            split = int(len(messages) * 0.67)
+            old_msgs = messages[:split]
+            summary_prompt = "请用中文简要总结以下对话的内容（200字以内），提取关键信息点：\n\n"
+            for m in old_msgs:
+                if m["role"] in ("user", "assistant"):
+                    content = m.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        summary_prompt += f"[{m['role']}]: {content[:500]}\n"
+            r = state["client"].chat.completions.create(
+                model=state["model"],
+                messages=[{"role": "user", "content": summary_prompt}],
+                max_tokens=500
+            )
+            summary = r.choices[0].message.content
+            memory["summary"] = summary
+            key_points = [line.strip("- ") for line in summary.split("\n") if line.strip().startswith(("-", "1.", "2.", "3.", "4.", "5."))]
+            memory["key_points"] = key_points[:10]
+            save_memory(session_name, memory)
+            print(f"[记忆] 已生成摘要: {session_name}")
+        except Exception as ex:
+            print(f"[记忆] 摘要生成失败: {ex}")
+
+    threading.Thread(target=do_summarize, daemon=True).start()
+
+# ============================================================
+
 def get_role_prompt(role_name):
     """获取 Agent 角色的系统提示词"""
     roles = state.get("agent_roles", DEFAULT_AGENT_ROLES)
@@ -449,13 +572,15 @@ def get_api_params():
         params["temperature"] = state.get("temperature", 0.7)
     return params
 
+_tool_progress = None  # 全局进度回调，在工具执行时被赋值
+
 def execute_tool_call(fn_name, fn_args):
     """执行工具调用，返回字符串结果"""
     try:
         if fn_name == "read_file_content":
             return read_file(fn_args.get("path", ""))
         elif fn_name == "write_file_content":
-            return write_file(fn_args.get("path", ""), fn_args.get("content", ""))
+            return write_file(fn_args.get("path", ""), fn_args.get("content", ""), _tool_progress)
         elif fn_name == "list_files":
             return list_dir(fn_args.get("dir", os.getcwd()))
         elif fn_name == "run_command":
@@ -503,7 +628,7 @@ def run_cmd(cmd):
     except Exception as ex:
         return f"命令执行失败: {ex}"
 
-def handle_api_response(msg_list, ac, text_control=None):
+def handle_api_response(msg_list, ac, text_control=None, session_name=""):
     """
     处理 API 响应：如果流式有内容直接返回，否则处理 tool_calls 循环
     返回 (assistant_msgs, tool_call_names)
@@ -514,7 +639,10 @@ def handle_api_response(msg_list, ac, text_control=None):
     assistant_msgs = []
     tool_calls_used = []
     current_msgs = list(msg_list)  # 不修改原始 msg_list
-    max_rounds = 5  # 避免无限循环
+    # 注入长记忆上下文
+    if session_name:
+        current_msgs = build_context_with_memory(current_msgs, session_name)
+    max_rounds = 10  # 真正的 Agent 多轮工具调用
     for _ in range(max_rounds):
         r = state["client"].chat.completions.create(model=state["model"], messages=current_msgs, tools=TOOLS, tool_choice="auto", **get_api_params())
         msg = r.choices[0].message
@@ -536,10 +664,19 @@ def handle_api_response(msg_list, ac, text_control=None):
                     fn_args = json.loads(tc.function.arguments)
                 except:
                     fn_args = {}
-                tool_result = execute_tool_call(fn_name, fn_args)
                 if text_control:
-                    text_control.value = f"🔧 调用工具: {fn_name}\n{tool_result[:300]}"
+                    round_info = f"第{len(tool_calls_used)}步" if len(tool_calls_used) > 1 else ""
+                    text_control.value = f"⚙️ {round_info}调用: {fn_name}..."
                     text_control.color = ft.Colors.BLUE_400 if state["theme_mode"] == ft.ThemeMode.DARK else ft.Colors.BLUE_700
+                # 设置进度回调（仅文件写入类工具使用）
+                if fn_name == "write_file_content" and text_control:
+                    def _on_progress(percent, written, total):
+                        text_control.value = f"⚙️ 写入文件: {percent}% ({written//1024}KB / {total//1024}KB)"
+                        text_control.color = ft.Colors.BLUE_400 if state["theme_mode"] == ft.ThemeMode.DARK else ft.Colors.BLUE_700
+                    global _tool_progress
+                    _tool_progress = _on_progress
+                tool_result = execute_tool_call(fn_name, fn_args)
+                _tool_progress = None  # 清除回调
                 current_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
             continue
         break
@@ -607,7 +744,7 @@ ICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAQAAAAAAAAA
 
 def main(page: ft.Page):
     global state
-    page.title = "DeepSeek Agent"
+    page.title = f"DeepSeek Agent v{VERSION}"
     page.padding = 0; page.spacing = 0
 
     # 窗口关闭时清理 MCP 连接
@@ -790,6 +927,7 @@ def main(page: ft.Page):
                                 ref_content = "\n\n".join(ref_parts) + "\n\n"
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
+                    msg_list = build_context_with_memory(msg_list, state["current_session"])
                     resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", **get_api_params())
                     if chat_list.controls and chat_list.controls[-1] == t:
                         chat_list.controls.remove(t)
@@ -798,7 +936,7 @@ def main(page: ft.Page):
                     text_control = ft.Text("正在思考...", size=13, color=colors["text_hint"])
                     reasoning_control = ft.Text("", size=12, color=colors["text_hint"], italic=True)
                     reasoning_container = ft.Container(padding=ft.Padding.only(left=8, top=4, right=8, bottom=4), border_radius=4, bgcolor=colors["card"], content=reasoning_control, visible=False)
-                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), reasoning_container, text_control], spacing=4))
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"], font_family=FONT_CJK), reasoning_container, text_control], spacing=4))
                     chat_list.controls.append(msg_container)
                     page.run_task(_safe_update)
                     for c in resp:
@@ -822,7 +960,7 @@ def main(page: ft.Page):
                         text_control.value = "正在调用工具..."
                         text_control.color = colors["text_hint"]
                         page.run_task(_safe_update)
-                        results, tool_calls = handle_api_response(msg_list, ac, text_control)
+                        results, tool_calls = handle_api_response(msg_list, ac, text_control, state["current_session"])
                         # 添加工具调用指示器
                         if tool_calls:
                             tc_indicator = ft.Container(
@@ -838,6 +976,7 @@ def main(page: ft.Page):
                         for r in results:
                             state["messages"].append(r)
                     save_msgs(state["current_session"], state["messages"])
+                    auto_summarize_if_needed(state["current_session"], state["messages"])
                     load_chat()
                 except Exception as ex:
                     if chat_list.controls and chat_list.controls[-1] == t:
@@ -918,7 +1057,7 @@ def main(page: ft.Page):
                         ref_chips_for_display.controls.append(ft.Container(content=ft.Row([ft.Icon(ft.Icons.FILE_OPEN), ft.Text(os.path.basename(rf["path"]), size=11)]), bgcolor=colors["primary"], border_radius=4, padding=ft.Padding.only(left=6, top=2, right=6, bottom=2)))
                     content_controls.insert(0, ft.Row([ft.Text("引用文件:", size=11, weight=ft.FontWeight.W_500), ref_chips_for_display], spacing=4, wrap=True))
 
-                message_row = ft.Row([ft.Column([ft.Text("你" if is_user else "AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"])] + content_controls, spacing=4, expand=True), make_message_popup(idx, is_user)], spacing=5)
+                message_row = ft.Row([ft.Column([ft.Text("你" if is_user else "AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"], font_family=FONT_CJK)] + content_controls, spacing=4, expand=True), make_message_popup(idx, is_user)], spacing=5)
                 if jump_btn:
                     message_row.controls.insert(0, jump_btn)
                 chat_list.controls.append(ft.Container(padding=10, border_radius=8, bgcolor=colors["user_msg"] if is_user else colors["assistant_msg"], content=message_row))
@@ -926,14 +1065,44 @@ def main(page: ft.Page):
             page.run_task(_safe_update)
 
         def format_content(content, colors):
-            parts = re.split(r'(```[\w]*\n?[\s\S]*?```)', content)
+            """格式化消息内容：代码块高亮、链接可点击、CJK字体"""
+            # 先提取链接，保护起来
+            link_pattern = r'(https?://[^\s<>"{}|\\^`\[\]]+)'
+            protected = {}
+            counter = [0]
+            def protect_link(m):
+                key = f"__LINK_{counter[0]}__"
+                protected[key] = m.group(1)
+                counter[0] += 1
+                return key
+            content_with_placeholders = re.sub(link_pattern, protect_link, content)
+
+            parts = re.split(r'(```[\w]*\n?[\s\S]*?```)', content_with_placeholders)
             controls = []
             for part in parts:
                 if part.startswith("```"):
                     lang = part.split('\n')[0].replace('`', '').strip()
                     code = '\n'.join(part.split('\n')[1:-1])
-                    controls.append(ft.Container(padding=8, border_radius=5, bgcolor=colors["code_bg"], content=ft.Column([ft.Row([ft.Text(lang or "code", size=10, weight=ft.FontWeight.W_500), ft.IconButton(ft.Icons.COPY, icon_size=14, on_click=lambda e, c=code: page.clipboard.set(c) or show_toast(page, "已复制"))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Text(code, size=12, font_family="Consolas")], spacing=4)))
-                elif part.strip(): controls.append(ft.Text(part.strip(), size=13, color=colors["text"]))
+                    controls.append(ft.Container(padding=8, border_radius=5, bgcolor=colors["code_bg"], content=ft.Column([ft.Row([ft.Text(lang or "code", size=10, weight=ft.FontWeight.W_500, font_family=FONT_CJK), ft.IconButton(ft.Icons.COPY, icon_size=14, on_click=lambda e, c=code: page.clipboard.set(c) or show_toast(page, "已复制"))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Text(code, size=12, font_family="Consolas")], spacing=4)))
+                elif part.strip():
+                    # 还原链接并创建可点击的文本
+                    text = part.strip()
+                    for key, url in protected.items():
+                        text = text.replace(key, url)
+                    # 检查是否包含链接
+                    if re.search(link_pattern, text):
+                        link_controls = []
+                        last_end = 0
+                        for m in re.finditer(link_pattern, text):
+                            if m.start() > last_end:
+                                link_controls.append(ft.Text(text[last_end:m.start()], size=13, color=colors["text"], font_family=FONT_CJK))
+                            link_controls.append(ft.TextButton(m.group(1), on_click=lambda e, u=m.group(1): page.launch_url(u), style=ft.ButtonStyle(padding=ft.Padding.only(left=2, right=2, top=0, bottom=0), color=colors["primary"]), icon=ft.Icons.OPEN_IN_NEW, icon_size=12))
+                            last_end = m.end()
+                        if last_end < len(text):
+                            link_controls.append(ft.Text(text[last_end:], size=13, color=colors["text"], font_family=FONT_CJK))
+                        controls.append(ft.Row(link_controls, wrap=True, spacing=0))
+                    else:
+                        controls.append(ft.Text(text, size=13, color=colors["text"], font_family=FONT_CJK))
             return controls or [ft.Text("", size=13)]
 
         def send_chat(e):
@@ -984,6 +1153,7 @@ def main(page: ft.Page):
                                 ref_content = "\n\n".join(ref_parts) + "\n\n"
                                 content = ref_content + content
                             msg_list.append({"role": m["role"], "content": content})
+                    msg_list = build_context_with_memory(msg_list, state["current_session"])
                     resp = state["client"].chat.completions.create(model=state["model"], messages=msg_list, stream=True, tools=TOOLS, tool_choice="auto", **get_api_params())
                     if chat_list.controls and chat_list.controls[-1] == t:
                         chat_list.controls.remove(t)
@@ -992,7 +1162,7 @@ def main(page: ft.Page):
                     text_control = ft.Text("正在思考...", size=13, color=colors["text_hint"])
                     reasoning_control = ft.Text("", size=12, color=colors["text_hint"], italic=True)
                     reasoning_container = ft.Container(padding=ft.Padding.only(left=8, top=4, right=8, bottom=4), border_radius=4, bgcolor=colors["card"], content=reasoning_control, visible=False)
-                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"]), reasoning_container, text_control], spacing=4))
+                    msg_container = ft.Container(padding=10, border_radius=8, bgcolor=colors["assistant_msg"], content=ft.Column([ft.Text("AI", size=12, weight=ft.FontWeight.BOLD, color=colors["primary"], font_family=FONT_CJK), reasoning_container, text_control], spacing=4))
                     chat_list.controls.append(msg_container)
                     page.run_task(_safe_update)
                     for c in resp:
@@ -1016,7 +1186,7 @@ def main(page: ft.Page):
                         text_control.value = "正在调用工具..."
                         text_control.color = colors["text_hint"]
                         page.run_task(_safe_update)
-                        results, tool_calls = handle_api_response(msg_list, ac, text_control)
+                        results, tool_calls = handle_api_response(msg_list, ac, text_control, state["current_session"])
                         # 添加工具调用指示器
                         if tool_calls:
                             tc_indicator = ft.Container(
@@ -1032,6 +1202,7 @@ def main(page: ft.Page):
                         for r in results:
                             state["messages"].append(r)
                     save_msgs(state["current_session"], state["messages"])
+                    auto_summarize_if_needed(state["current_session"], state["messages"])
                     load_chat()
                 except Exception as ex:
                     if chat_list.controls and chat_list.controls[-1] == t:
@@ -1045,7 +1216,7 @@ def main(page: ft.Page):
                         error_text = "服务器错误，请稍后再试"
                     else:
                         error_text = f"错误: {ex}"
-                    chat_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["error_msg"], content=ft.Text(error_text, color=ft.Colors.RED, size=12)))
+                    chat_list.controls.append(ft.Container(padding=8, border_radius=8, bgcolor=colors["error_msg"], content=ft.Text(error_text, color=ft.Colors.RED, size=12, font_family=FONT_CJK)))
                     page.run_task(_safe_update)
                 finally:
                     send_btn.disabled = False
@@ -1101,7 +1272,7 @@ def main(page: ft.Page):
 
         quick_bar = ft.Row([agent_dropdown, ft.Container(expand=True, content=skills_bar), deep_think_switch, deep_think_label], spacing=8, alignment=ft.MainAxisAlignment.START)
 
-        chat_input = ft.TextField(hint_text="输入消息...", expand=True, multiline=True, min_lines=1, max_lines=4, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"]))
+        chat_input = ft.TextField(hint_text="输入消息...", expand=True, multiline=True, min_lines=1, max_lines=4, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"], font_family=FONT_CJK), text_style=ft.TextStyle(font_family=FONT_CJK))
         send_btn = ft.Button("发送", on_click=send_chat, width=70)
         session_info_bar = ft.Text("", size=11, color=colors["text_hint"])
 
@@ -1110,7 +1281,7 @@ def main(page: ft.Page):
             chars = sum(len(m.get("content", "")) for m in state["messages"])
             session_info_bar.value = f"{state['current_session']} | ~{tokens} tokens | {chars} 字" if state['current_session'] else "请选择会话"
             session_info_bar.update()
-        header = ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text("DeepSeek Agent", size=17, weight=ft.FontWeight.BOLD, color=colors["text"]), session_info_bar], spacing=0), ft.Row([ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="清空", on_click=clear_chat), ft.IconButton(ft.Icons.DELETE_FOREVER, icon_size=16, tooltip="删除会话", on_click=del_current_session), ft.IconButton(ft.Icons.DARK_MODE, icon_size=16, tooltip="切换主题", on_click=toggle_theme)], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
+        header = ft.Container(padding=10, bgcolor=colors["card"], content=ft.Row([ft.Column([ft.Text(f"DeepSeek Agent v{VERSION}", size=17, weight=ft.FontWeight.BOLD, color=colors["text"], font_family=FONT_CJK), session_info_bar], spacing=0), ft.Row([ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="清空", on_click=clear_chat), ft.IconButton(ft.Icons.DELETE_FOREVER, icon_size=16, tooltip="删除会话", on_click=del_current_session), ft.IconButton(ft.Icons.DARK_MODE, icon_size=16, tooltip="切换主题", on_click=toggle_theme)], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
 
         # == 左侧会话列表（类 ChatGPT 布局）==
         sidebar_search = ft.TextField(hint_text="搜索...", border=ft.InputBorder.OUTLINE, color=colors["text"], hint_style=ft.TextStyle(color=colors["text_hint"]), text_size=11, on_change=lambda e: refresh_sidebar())
@@ -1695,7 +1866,6 @@ def main(page: ft.Page):
             page.run_task(_do_check_balance)
 
         async def _do_check_balance():
-            import requests
             loop = asyncio.get_running_loop()
             try:
                 r = await loop.run_in_executor(
@@ -1830,8 +2000,8 @@ def main(page: ft.Page):
             ft.Row([ft.Button("保存设置", on_click=save_settings, width=140), ft.Button("清理会话", on_click=clear_cache, width=140, bgcolor=ft.Colors.RED_200)], spacing=8),
             ft.Row([ft.Button("清除所有数据", on_click=clear_all_data, width=200, bgcolor=ft.Colors.RED), ft.IconButton(ft.Icons.FOLDER_OPEN, icon_size=18, tooltip="打开数据文件夹", on_click=lambda e: subprocess.Popen(['explorer', APP_DIR]))], spacing=8),
             ft.Text(f"数据目录: {APP_DIR}", size=10, color=colors["text_hint"]),
-            ft.Divider(), ft.Text("DeepSeek Agent", size=12, color=colors["text_hint"]),
-            ft.TextButton("GitHub: https://github.com/FDLAlfrid/dsa_acd", icon=ft.Icons.OPEN_IN_NEW, on_click=lambda e: page.launch_url("https://github.com/FDLAlfrid/dsa_acd"), style=ft.ButtonStyle(padding=0, color=colors["primary"]))
+            ft.Divider(),
+            ft.Row([ft.Text(f"DeepSeek Agent v{VERSION}", size=12, color=colors["text_hint"], font_family=FONT_CJK), ft.TextButton("GitHub", icon=ft.Icons.OPEN_IN_NEW, on_click=lambda e: page.launch_url("https://github.com/FDLAlfrid/dsa_acd"), style=ft.ButtonStyle(padding=ft.Padding.only(left=4, right=4, top=0, bottom=0), color=colors["primary"]))], spacing=8, alignment=ft.MainAxisAlignment.START),
         ], spacing=12, scroll=ft.ScrollMode.AUTO), expand=True), nav_bar(colors)])
         page.update()
         load_role_list_ui()
