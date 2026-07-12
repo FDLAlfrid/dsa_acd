@@ -1,6 +1,6 @@
-<div align="right">🌐 <a href="#deepseek-agent">English</a> · <a href="#deepseek-agent-中文">中文</a></div>
+<div align="right">🌐 <a href="#deepseek-agent">English</a> · <a href="#中文">中文</a></div>
 
-# DeepSeek Agent v0.1.1
+# DeepSeek Agent v0.0.1
 
 A cross-platform desktop AI agent powered by DeepSeek API, built with Flet.
 Supports function calling with MCP tool integration, co-sharing MCP server configs with Trae IDE.
@@ -55,7 +55,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Build EXE (v0.1.1)
+## Build EXE (v0.0.1)
 
 > **重要**：打包前必须先激活 conda 环境（或 venv），否则 PyInstaller 会打包错误的依赖。
 
@@ -77,12 +77,12 @@ EXE 版本号由 `version_info.txt` 控制，打包后右键 EXE → 属性 → 
 
 | 位置 | 说明 | 示例 |
 |------|------|------|
-| `filevers=(1, 0, 0, 0)` | 文件版本（4 位元组） | 改 `(1, 1, 0, 0)` |
-| `prodvers=(1, 0, 0, 0)` | 产品版本（同上） | 改 `(1, 1, 0, 0)` |
-| `StringStruct(u'FileVersion', u'1.0.0')` | 文件版本字符串 | 改 `u'1.1.0'` |
-| `StringStruct(u'ProductVersion', u'1.0.0')` | 产品版本字符串 | 改 `u'1.1.0'` |
+| `filevers=(0, 0, 1, 0)` | 文件版本（4 位元组） | 改 `(0, 0, 2, 0)` |
+| `prodvers=(0, 0, 1, 0)` | 产品版本（同上） | 改 `(0, 0, 2, 0)` |
+| `StringStruct(u'FileVersion', u'0.0.1')` | 文件版本字符串 | 改 `u'0.0.2'` |
+| `StringStruct(u'ProductVersion', u'0.0.1')` | 产品版本字符串 | 改 `u'0.0.2'` |
 
-同时同步修改 `main.py` 中的 `VERSION = "1.0.0"` 常量（窗口标题栏显示）。
+同时同步修改 `main.py` 中的 `VERSION = "0.0.1"` 常量（窗口标题栏显示）。
 
 ## Data Directory
 
@@ -94,7 +94,7 @@ GPL 3.0
 
 ---
 
-# DeepSeek Agent v0.1.1 中文
+# 中文
 
 基于 DeepSeek API 的跨平台桌面 AI 助手，使用 Flet 构建。
 支持函数调用和 MCP 工具集成，与 Trae IDE 共用 MCP 服务器配置。
