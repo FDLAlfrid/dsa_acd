@@ -1,0 +1,50 @@
+# UTF-8
+#
+# 修改版本号时，改下面 4 处值即可：
+#   filevers=(0, 0, 1, 0)   → 文件版本（元组）
+#   prodvers=(0, 0, 1, 0)   → 产品版本（元组）
+#   StringStruct(u'FileVersion', u'0.0.1')    → 文件版本（字符串）
+#   StringStruct(u'ProductVersion', u'0.0.1') → 产品版本（字符串）
+# 同时别忘了同步 main.py 中 VERSION = "0.0.1"
+#
+# For more details about fixed file info 'ffi' see:
+# http://msdn.microsoft.com/en-us/library/ms646997.aspx
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    # filevers and prodvers should be always a tuple with four items: (1, 2, 3, 4)
+    # Set not needed items to zero 0.
+    filevers=(0, 0, 1, 0),
+    prodvers=(0, 0, 1, 0),
+    # Contains a bitmask that specifies the valid bits 'flags'
+    mask=0x3f,
+    # Contains a bitmask that specifies the Boolean attributes of the file.
+    flags=0x0,
+    # The operating system for which this file was designed.
+    # 0x4 - NT and there is no need to change it.
+    OS=0x40004,
+    # The general type of file.
+    # 0x1 - the file is an application.
+    fileType=0x1,
+    # The function of the file.
+    # 0x0 - the function is not defined for this fileType
+    subtype=0x0,
+    # Creation date and time stamp.
+    date=(0, 0)
+    ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'FDLAlfrid'),
+        StringStruct(u'FileDescription', u'DeepSeek Agent - AI Desktop Assistant'),
+        StringStruct(u'FileVersion', u'0.0.1'),
+        StringStruct(u'InternalName', u'DeepSeekAgent'),
+        StringStruct(u'LegalCopyright', u'Copyright (c) 2025 FDLAlfrid'),
+        StringStruct(u'OriginalFilename', u'DeepSeekAgent.exe'),
+        StringStruct(u'ProductName', u'DeepSeek Agent'),
+        StringStruct(u'ProductVersion', u'0.0.1')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
