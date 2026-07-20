@@ -67,8 +67,10 @@ conda activate deepseek_agent      # Conda 用户
 # 2. 安装依赖
 pip install flet openai requests pyinstaller
 
-# 3. 一键打包
-pyinstaller DeepSeekAgent.spec
+# 3. 一键打包（必须包含 --collect-data，否则运行时缺少 icons.json）
+pyinstaller --name "DeepSeekAgent" --icon=icon.ico --version-file=version_info.txt ^
+  --onefile --windowed --hidden-import=flet_desktop --hidden-import=flet ^
+  --collect-data flet --collect-data flet_desktop main.py --specpath .
 ```
 
 ### 版本号修改
