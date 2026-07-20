@@ -3,7 +3,7 @@ import os, json, time, gc, base64, re, subprocess, sys, platform, shutil, thread
 try: from openai import OpenAI
 except: OpenAI = None
 
-VERSION = "0.1.1"
+VERSION = "0.0.1"
 APP_NAME = "DeepSeek Agent"
 APP_DIR = os.path.join(os.path.expanduser("~"), ".deepseek_sessions")
 SESSION_DIR = os.path.join(APP_DIR, "sessions")
@@ -313,12 +313,14 @@ def delete_session(name):
             except PermissionError: gc.collect(); time.sleep(0.1)
             except: return
 
-def create_session(name, system_prompt=None):
+def create_session(name, system_prompt=None, agent_role=None):
     path = session_path(name)
     if os.path.exists(path): return False
     if system_prompt is None:
         system_prompt = get_default_system_prompt()
-    msgs = [{"role": "system", "content": system_prompt}]
+    if agent_role is None:
+        agent_role = state.get("agent_role", "通用助手")
+    msgs = [{"role": "system", "content": system_prompt, "agent_role": agent_role}]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(msgs, f, ensure_ascii=False, indent=2)
     return True
@@ -331,7 +333,7 @@ def load_msgs(name):
     path = session_path(name)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    return [{"role": "system", "content": get_default_system_prompt()}]
+    return [{"role": "system", "content": get_default_system_prompt(), "agent_role": state.get("agent_role", "通用助手")}]
 
 def read_file(path):
     try:
@@ -765,6 +767,7 @@ def main(page: ft.Page):
         page.window_icon = icon_path
     except: pass
 
+    global state
     state = {"api_key": "", "model": "deepseek-v4-flash", "theme_mode": ft.ThemeMode.LIGHT, "current_session": "", "messages": [], "current_path": os.getcwd(), "system_prompt": get_default_system_prompt(), "quick_prompts": [("总结", "请总结一下以上内容"), ("翻译", "请翻译成中文"), ("代码审查", "请审查以下代码")], "client": None, "max_context_tokens": 32000, "max_tokens": 2048, "temperature": 0.7, "thinking_enabled": False, "reasoning_effort": "high", "agent_role": "通用助手", "agent_roles": dict(DEFAULT_AGENT_ROLES), "ref_files": [], "mcp_enabled": False, "balance_result": "", "conn_result": ""}
 
     async def _safe_update():
@@ -821,8 +824,64 @@ def main(page: ft.Page):
         if state["current_session"] and state["messages"]:
             save_msgs(state["current_session"], state["messages"])
 
+    def restore_role_from_session():
+        """从当前会话的系统消息中恢复角色和系统提示词，确保所有页面同步"""
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] restore_role_from_session() called, before: agent_role={state.get('agent_role')}\n")
+        except: pass
+        if state["messages"] and state["messages"][0].get("role") == "system":
+            saved_role = state["messages"][0].get("agent_role")
+            saved_prompt = state["messages"][0].get("content")
+            # 先恢复提示词（会话中保存的是用户实际使用的）
+            if saved_prompt:
+                state["system_prompt"] = saved_prompt
+            # 再恢复角色
+            if saved_role:
+                state["agent_role"] = saved_role
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] restore_role_from_session() done, after: agent_role={state.get('agent_role')}\n")
+        except: pass
+
+    def sync_role_to_session():
+        """将当前角色同步到当前会话的系统消息"""
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] sync_role_to_session() called, agent_role={state.get('agent_role')}\n")
+        except: pass
+        if state["messages"] and state["messages"][0].get("role") == "system":
+            state["messages"][0]["content"] = state["system_prompt"]
+            state["messages"][0]["agent_role"] = state["agent_role"]
+            if state["current_session"]:
+                save_msgs(state["current_session"], state["messages"])
+
     def nav_bar(colors):
         def nav_to(view_name):
+            # 切换页面前，从当前页面的控件主动读取值并同步
+            cv = current_view.get("name", "")
+            if cv == "settings" and "_settings_role_dd" in state:
+                dd_val = state["_settings_role_dd"].value
+                prompt_val = state.get("_settings_prompt_input", {}).get("value", "")
+                if dd_val and dd_val != state.get("agent_role"):
+                    state["agent_role"] = dd_val
+                    state["system_prompt"] = get_role_prompt(dd_val)
+                    sync_role_to_session()
+                    auto_save_settings()
+                elif prompt_val and prompt_val != state.get("system_prompt"):
+                    state["system_prompt"] = prompt_val
+                    sync_role_to_session()
+                    auto_save_settings()
+            elif cv == "chat" and "_chat_agent_dd" in state:
+                dd_val = state["_chat_agent_dd"].value
+                if dd_val and dd_val != state.get("agent_role"):
+                    state["agent_role"] = dd_val
+                    state["system_prompt"] = get_role_prompt(dd_val)
+                    sync_role_to_session()
+                    auto_save_settings()
             save_current_state()
             if view_name == "chat": show_chat()
             elif view_name == "files": show_files()
@@ -835,6 +894,7 @@ def main(page: ft.Page):
         current_view["name"] = "chat"
         colors = get_theme_colors()
         main_column.controls.clear()
+        restore_role_from_session()
 
         ref_chips = ft.Row(wrap=True, spacing=3)
 
@@ -1228,17 +1288,40 @@ def main(page: ft.Page):
 
         # == Agent 选择器 + 技能按钮 + 深度思考开关 ==
         agent_names = list(state.get("agent_roles", DEFAULT_AGENT_ROLES).keys())
-        agent_dropdown = ft.Dropdown(value=state.get("agent_role", "通用助手"), options=[ft.dropdown.Option(k) for k in agent_names], width=130, text_size=12, border=ft.InputBorder.OUTLINE, color=colors["text"])
+        current_role = state.get("agent_role", "通用助手")
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] show_chat() building dropdown with agent_role={current_role}\n")
+        except: pass
+        agent_dropdown = ft.Dropdown(value=current_role, options=[ft.dropdown.Option(k) for k in agent_names], width=130, text_size=12, border=ft.InputBorder.OUTLINE, color=colors["text"])
+        state["_chat_agent_dd"] = agent_dropdown
         def on_agent_change(e):
-            state["agent_role"] = agent_dropdown.value
-            state["system_prompt"] = get_role_prompt(agent_dropdown.value)
-            # 更新当前会话的 system prompt
-            if state["messages"] and state["messages"][0].get("role") == "system":
-                state["messages"][0]["content"] = state["system_prompt"]
-                save_msgs(state["current_session"], state["messages"])
-            refresh_skills_bar()
-            page.update()
+            try:
+                log_path = os.path.join(APP_DIR, "debug_log.txt")
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] on_agent_change() called! event={e}\n")
+
+                new_role = agent_dropdown.value
+                state["agent_role"] = new_role
+                state["system_prompt"] = get_role_prompt(new_role)
+
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] on_agent_change() state updated: agent_role={state['agent_role']}, system_prompt_len={len(state['system_prompt'])}\n")
+
+                sync_role_to_session()
+                refresh_skills_bar()
+                auto_save_settings()
+                show_toast(page, f"已切换角色: {state['agent_role']}")
+                page.update()
+            except Exception as ex:
+                import traceback
+                log_path = os.path.join(APP_DIR, "debug_log.txt")
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] on_agent_change() failed: {ex}\n")
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Traceback: {traceback.format_exc()}\n")
         agent_dropdown.on_change = on_agent_change
+        print(f"[DEBUG] agent_dropdown.on_change set successfully")
 
         skills_bar = ft.Row([], spacing=4, wrap=True)
 
@@ -1330,9 +1413,7 @@ def main(page: ft.Page):
             save_current_state()
             state["current_session"] = name
             state["messages"] = load_msgs(name)
-            # 同步系统提示词：如果当前有系统提示词且会话第一个消息是 system，则更新
-            if state["messages"] and state["messages"][0].get("role") == "system":
-                state["messages"][0]["content"] = state["system_prompt"]
+            restore_role_from_session()
             show_chat()
 
         def rename_session_dialog(name):
@@ -1353,6 +1434,7 @@ def main(page: ft.Page):
                     sessions = list_sessions()
                     state["current_session"] = sessions[0] if sessions else ""
                     state["messages"] = load_msgs(sessions[0]) if sessions else []
+                    restore_role_from_session()
                 show_chat()
             confirm_dialog(page, "确认删除", f"确定删除会话「{name}」？", do_del)
 
@@ -1384,7 +1466,7 @@ def main(page: ft.Page):
 
     def clear_chat():
         def do_clear():
-            state["messages"] = [{"role": "system", "content": state["system_prompt"]}]
+            state["messages"] = [{"role": "system", "content": state["system_prompt"], "agent_role": state["agent_role"]}]
             save_msgs(state["current_session"], state["messages"])
             show_toast(page, "已清空"); show_chat()
         confirm_dialog(page, "确认清空", "确定要清空当前对话吗？", do_clear)
@@ -1396,6 +1478,7 @@ def main(page: ft.Page):
             delete_session(name); sessions = list_sessions()
             if sessions: state["current_session"] = sessions[0]; state["messages"] = load_msgs(sessions[0])
             else: state["current_session"] = ""; state["messages"] = []
+            restore_role_from_session()
             show_toast(page, f"已删除: {name}"); show_chat()
         confirm_dialog(page, "确认删除", f"确定删除会话「{name}」？", do_delete)
 
@@ -1535,7 +1618,7 @@ def main(page: ft.Page):
                 if not name: show_toast(page, "名称不能为空"); return
                 dlg.open = False; page.update()
                 state["current_session"] = name
-                state["messages"] = [{"role": "system", "content": state["system_prompt"]}]
+                state["messages"] = [{"role": "system", "content": state["system_prompt"], "agent_role": state["agent_role"]}]
                 save_msgs(name, state["messages"]); show_toast(page, f"已创建: {name}"); show_chat()
             show_dialog(page, dlg)
 
@@ -1551,6 +1634,7 @@ def main(page: ft.Page):
                     if state["current_session"] == n:
                         if sessions: state["current_session"] = sessions[0]; state["messages"] = load_msgs(sessions[0])
                         else: state["current_session"] = ""; state["messages"] = []
+                        restore_role_from_session()
                     show_toast(page, f"已删除: {n}"); load_sessions()
                     if not sessions: show_chat()
                 show_dialog(page, dlg)
@@ -1560,6 +1644,7 @@ def main(page: ft.Page):
             def handler(e):
                 state["current_session"] = session_name
                 state["messages"] = load_msgs(session_name)
+                restore_role_from_session()
                 show_toast(page, f"已切换到: {session_name}"); show_chat()
             return handler
 
@@ -1614,24 +1699,47 @@ def main(page: ft.Page):
         page.update()
         load_sessions()
 
+    # ===== 全局自动保存函数 =====
+    def auto_save_settings():
+        """自动保存设置到文件（不含 API Key）"""
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] auto_save_settings() called\n")
+                
+            save_data = {k: state[k] for k in ["model", "system_prompt", "quick_prompts", "agent_role", "agent_roles", "max_context_tokens", "max_tokens", "temperature", "thinking_enabled", "reasoning_effort", "mcp_enabled"]}
+            
+            tm = state.get("theme_mode")
+            save_data["theme_mode"] = tm.value if hasattr(tm, 'value') else tm
+            
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Saved agent_role={save_data['agent_role']}\n")
+                
+            # 验证保存
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded back agent_role={loaded.get('agent_role')}\n")
+                
+        except Exception as ex:
+            import traceback
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Save failed: {ex}\n")
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Traceback: {traceback.format_exc()}\n")
+
     # ========== 设置页面 ==========
     def show_settings():
         current_view["name"] = "settings"
         colors = get_theme_colors()
         main_column.controls.clear()
+        restore_role_from_session()
 
         api_key_input = ft.TextField(label="API Key", password=True, value=state["api_key"], expand=True, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="sk-...", hint_style=ft.TextStyle(color=colors["text_hint"]))
         model_dropdown = ft.Dropdown(label="模型", value=state["model"], options=[ft.dropdown.Option("deepseek-v4-flash"), ft.dropdown.Option("deepseek-v4-pro")], border=ft.InputBorder.OUTLINE, color=colors["text"])
-
-        # ===== 自动保存函数 =====
-        def auto_save_settings():
-            """自动保存设置到文件（不含 API Key）"""
-            save_data = {k: state[k] for k in ["model", "theme_mode", "system_prompt", "quick_prompts", "agent_role", "agent_roles", "max_context_tokens", "max_tokens", "temperature", "thinking_enabled", "reasoning_effort", "mcp_enabled"]}
-            save_data["theme_mode"] = save_data["theme_mode"].value if hasattr(save_data["theme_mode"], 'value') else save_data["theme_mode"]
-            try:
-                with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                    json.dump(save_data, f, ensure_ascii=False, indent=2)
-            except: pass
 
         def on_api_key_change(e):
             key = api_key_input.value.strip()
@@ -1653,12 +1761,30 @@ def main(page: ft.Page):
         
         # Agent 角色/场景（可自定义）
         role_names = list(state.get("agent_roles", DEFAULT_AGENT_ROLES).keys())
-        role_dropdown = ft.Dropdown(label="Agent 角色/场景", value=state.get("agent_role", "通用助手"), options=[ft.dropdown.Option(k) for k in role_names], border=ft.InputBorder.OUTLINE, color=colors["text"])
+        current_role = state.get("agent_role", "通用助手")
+        try:
+            log_path = os.path.join(APP_DIR, "debug_log.txt")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] show_settings() building dropdown with agent_role={current_role}\n")
+        except: pass
+        role_dropdown = ft.Dropdown(label="Agent 角色/场景", value=current_role, options=[ft.dropdown.Option(k) for k in role_names], border=ft.InputBorder.OUTLINE, color=colors["text"])
+        state["_settings_role_dd"] = role_dropdown
         role_list = ft.ListView(expand=True, spacing=5)
+        
+        system_prompt_input = ft.TextField(label="系统提示词 (System Prompt)", value=state["system_prompt"], expand=True, multiline=True, min_lines=4, max_lines=8, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="设置AI助手的默认行为和约束...", hint_style=ft.TextStyle(color=colors["text_hint"]))
+        state["_settings_prompt_input"] = system_prompt_input
+        
         def on_role_change(e):
             role = role_dropdown.value
+            try:
+                log_path = os.path.join(APP_DIR, "debug_log.txt")
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] on_role_change() called, role={role}\n")
+            except: pass
             state["agent_role"] = role
-            system_prompt_input.value = get_role_prompt(role)
+            state["system_prompt"] = get_role_prompt(role)
+            system_prompt_input.value = state["system_prompt"]
+            sync_role_to_session()
             auto_save_settings()
             page.update()
         role_dropdown.on_change = on_role_change
@@ -1692,14 +1818,24 @@ def main(page: ft.Page):
             si = ft.TextField(label="技能 (逗号分隔)", value=rskills, border=ft.InputBorder.OUTLINE, hint_text="例如: 代码审查,找Bug,写注释")
             dlg = ft.AlertDialog(title=ft.Text("编辑角色"), content=ft.Column([ni, pi, si], spacing=10), actions=[ft.TextButton("取消"), ft.Button("保存")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
-            dlg.actions[1].on_click = lambda e: (
-                setattr(dlg, 'open', False) or
-                (ni.value.strip() and pi.value.strip() and (
-                    (ni.value.strip() != rname and ni.value.strip() not in roles) or ni.value.strip() == rname
-                ) and (
-                    roles.pop(rname, None),
-                    roles.__setitem__(ni.value.strip(), {"prompt": pi.value.strip(), "skills": [s.strip() for s in si.value.split(",") if s.strip()]})
-                ) or True) or update_role_ui())
+            def do_save():
+                new_name = ni.value.strip()
+                new_prompt = pi.value.strip()
+                if not new_name or not new_prompt: return
+                if new_name != rname and new_name in roles: return
+                roles.pop(rname, None)
+                new_skills = [s.strip() for s in si.value.split(",") if s.strip()]
+                roles[new_name] = {"prompt": new_prompt, "skills": new_skills}
+                # 如果编辑的是当前角色，同步更新
+                if state["agent_role"] == rname:
+                    state["agent_role"] = new_name
+                    state["system_prompt"] = new_prompt
+                    role_dropdown.value = new_name
+                    system_prompt_input.value = new_prompt
+                    sync_role_to_session()
+                auto_save_settings()
+                update_role_ui()
+            dlg.actions[1].on_click = lambda e: (setattr(dlg, 'open', False) or do_save())
             show_dialog(page, dlg)
 
         def delete_role(idx):
@@ -1709,7 +1845,11 @@ def main(page: ft.Page):
             roles.pop(rname, None)
             if state["agent_role"] == rname:
                 state["agent_role"] = "通用助手"
+                state["system_prompt"] = get_role_prompt("通用助手")
                 role_dropdown.value = "通用助手"
+                system_prompt_input.value = state["system_prompt"]
+                sync_role_to_session()
+            auto_save_settings()
             update_role_ui()
 
         def add_role(e):
@@ -1718,10 +1858,13 @@ def main(page: ft.Page):
             si = ft.TextField(label="技能 (逗号分隔)", hint_text="例如: 辩论,反驳,论证", border=ft.InputBorder.OUTLINE)
             dlg = ft.AlertDialog(title=ft.Text("新增角色"), content=ft.Column([ni, pi, si], spacing=10), actions=[ft.TextButton("取消"), ft.Button("添加")])
             dlg.actions[0].on_click = lambda e: (setattr(dlg, 'open', False), page.update())
-            dlg.actions[1].on_click = lambda e: (
-                setattr(dlg, 'open', False) or
-                (ni.value.strip() and pi.value.strip() and ni.value.strip() not in state.setdefault("agent_roles", {}) and
-                 state["agent_roles"].__setitem__(ni.value.strip(), {"prompt": pi.value.strip(), "skills": [s.strip() for s in si.value.split(",") if s.strip()]}) or True) or update_role_ui())
+            def do_add():
+                if not ni.value.strip() or not pi.value.strip(): return
+                if ni.value.strip() in state.setdefault("agent_roles", {}): return
+                state["agent_roles"][ni.value.strip()] = {"prompt": pi.value.strip(), "skills": [s.strip() for s in si.value.split(",") if s.strip()]}
+                auto_save_settings()
+                update_role_ui()
+            dlg.actions[1].on_click = lambda e: (setattr(dlg, 'open', False) or do_add())
             show_dialog(page, dlg)
 
         def update_role_ui():
@@ -1730,13 +1873,9 @@ def main(page: ft.Page):
             load_role_list_ui()
             page.update()
 
-        system_prompt_input = ft.TextField(label="系统提示词 (System Prompt)", value=state["system_prompt"], expand=True, multiline=True, min_lines=4, max_lines=8, border=ft.InputBorder.OUTLINE, color=colors["text"], hint_text="设置AI助手的默认行为和约束...", hint_style=ft.TextStyle(color=colors["text_hint"]))
         def on_system_prompt_blur(e):
             state["system_prompt"] = system_prompt_input.value.strip()
-            # 同步更新当前会话的 system prompt 并保存
-            if state["messages"] and state["messages"][0].get("role") == "system":
-                state["messages"][0]["content"] = state["system_prompt"]
-                save_msgs(state["current_session"], state["messages"])
+            sync_role_to_session()
             auto_save_settings()
         system_prompt_input.on_blur = on_system_prompt_blur
         quick_prompts_list = ft.ListView(expand=True, spacing=5)
@@ -1956,6 +2095,7 @@ def main(page: ft.Page):
             state["model"] = model_dropdown.value
             state["system_prompt"] = system_prompt_input.value.strip()
             state["agent_role"] = role_dropdown.value
+            sync_role_to_session()
             try:
                 state["client"] = OpenAI(api_key=state["api_key"], base_url="https://api.deepseek.com/v1") if OpenAI else None
             except Exception as ex:
@@ -2009,7 +2149,10 @@ def main(page: ft.Page):
 
     # 启动
     sessions = list_sessions()
-    if sessions: state["current_session"] = sessions[0]; state["messages"] = load_msgs(sessions[0])
+    if sessions:
+        state["current_session"] = sessions[0]
+        state["messages"] = load_msgs(sessions[0])
+        restore_role_from_session()
     show_chat()
 
 ft.run(main)
